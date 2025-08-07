@@ -71,6 +71,7 @@ def get_args():
     parser.add_argument("--save_dir", type=str, default="./results/")
     parser.add_argument("--base_model", type=str, default="vit_tiny_patch16_224.augreg_in21k")
     
+    parser.add_argument("--threshold_brain_presence", type=float, default=0)
     parser.add_argument("--n_splits", type=int, default=5)
     parser.add_argument("--in_channels", type=int, default=1)
     parser.add_argument("--is_numpy", type=int, default=0)
@@ -110,8 +111,11 @@ if __name__ == "__main__":
     df_train = pd.read_csv(args.train_csv)
     df_test  = pd.read_csv(args.test_csv)
     df_train["patient_id"] = df_train["filename"].str.extract(r"(LISA_\d+)")
-    df_test["patient_id"]   = df_test["filename"].str.extract(r"(LISA_VALIDATION_\d+)")
-
+    df_test["patient_id"]  = df_test["filename"].str.extract(r"(LISA_VALIDATION_\d+)")
+    
+    df_train = df_train[df_train["ratio"]>=args.threshold_brain_presence].reset_index()
+    df_test  = df_test[df_test["ratio"]>=args.threshold_brain_presence].reset_index()
+    
     # 🎯 Clases
     args.label_cols = args.label_cols.split(",")
 
@@ -164,20 +168,21 @@ if __name__ == "__main__":
     maxvit_tiny_rw_224.sw_in1k
 
     python 4.training2d.py \
-    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/maxvit_tiny_rw_224.sw_in1k2D_final \
-    --experiment_name maxvit_tiny_rw_224.sw_in1k2D_final \
+    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/maxvit_nano_rw_256.sw_in1k2D_finalratio0.1 \
+    --experiment_name maxvit_nano_rw_256.sw_in1k2D_finalratio0.1 \
+    --threshold_brain_presence 0.1 \
     --batch_size 32 \
     --in_channels 1 \
     --mixup_prob 1 \
     --is_numpy 1 \
-    --image_size 224 \
-    --base_model maxvit_tiny_rw_224.sw_in1k \
+    --image_size 256 \
+    --base_model maxvit_nano_rw_256.sw_in1k \
     --loss_name focal_loss \
     --use_manual_weights 1 \
     --epochs 2000 \
     --patience 10 \
     --type_modeling 2d \
-    --device cuda:4 \
+    --device cuda:3 \
     --lr 1e-5 \
     --weight_decay 1e-3 \
     --use_sampling 0 \
