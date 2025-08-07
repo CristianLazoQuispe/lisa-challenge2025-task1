@@ -23,9 +23,9 @@ def extract_group_id(filename):
 
 """
 """
-def get_aug_transforms():
+def get_aug_transforms(image_size):
     return [
-            A.Resize(256, 256),
+            A.Resize(image_size, image_size),
             # 🔁 Flip + rotación leve
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
@@ -38,7 +38,7 @@ def get_aug_transforms():
                 # 🔳 Apagar zonas aleatorias (simula distorsión visual o falta de señal)
                 A.CoarseDropout(max_holes=2, max_height=50, max_width=50, fill_value=0, p=1.0),
                 # 🖼️ Zoom tipo crop + resize (cambia FOV)
-                A.RandomResizedCrop(size=(256, 256), scale=(0.85, 1.0), ratio=(0.9, 1.1), p=1.0),
+                A.RandomResizedCrop(size=(image_size, image_size), scale=(0.85, 1.0), ratio=(0.9, 1.1), p=1.0),
             ], p=0.33),
 
             A.OneOf([
@@ -58,9 +58,9 @@ def get_aug_transforms():
 
             ToTensorV2()]
 
-def get_base_transforms():
+def get_base_transforms(image_size):
     return [
-                A.Resize(256, 256),
+                A.Resize(image_size, image_size),
                 #A.Normalize(mean=(0.5,), std=(0.5,)),
                 ToTensorV2()
             ]
@@ -68,7 +68,7 @@ def get_base_transforms():
 
 # ✅ DATASET
 class MRIDataset2D(Dataset):
-    def __init__(self, df, is_train=True,use_augmentation = False,is_numpy=False,labels=[],transform = None):
+    def __init__(self, df, is_train=True,use_augmentation = False,is_numpy=False,labels=[],transform = None,image_size=256):
         self.df = df.reset_index(drop=True)
         self.is_train = is_train
         self.use_augmentation = use_augmentation
@@ -82,9 +82,9 @@ class MRIDataset2D(Dataset):
 
         if transform is None:
             if self.use_augmentation:
-                self.transform = A.Compose(get_aug_transforms())
+                self.transform = A.Compose(get_aug_transforms(image_size))
             else:
-                self.transform = A.Compose(get_base_transforms())
+                self.transform = A.Compose(get_base_transforms(image_size))
         else:
             self.transform = A.Compose(transform)
 

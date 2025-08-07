@@ -152,9 +152,6 @@ def update_optimizer(model,optimizer, grad_scaler, clip_grad_max_norm,lr_schedul
 def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
     os.makedirs(args.save_dir, exist_ok=True)
     logging.basicConfig(filename=f"{args.save_dir}/training.log", level=logging.INFO)
-
-    df_train = df_train
-
     weights_per_label = utils.compute_weights_from_df(df_train, use_manual = bool(args.use_manual_weights))
     print("weights_per_label:",weights_per_label)
     criterions = get_per_label_criterions(label_cols, weights_per_label, args)
@@ -183,9 +180,9 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
         window_f1 = SlidingWindowAverage(window_size=5)
         # Dataset
         if args.type_modeling == "2d":
-            train_ds = MRIDataset2D(df=df_tr  ,is_train=True,use_augmentation=True, is_numpy=bool(args.is_numpy),labels=args.label_cols)
-            val_ds   = MRIDataset2D(df=df_val ,is_train=True,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols)
-            test_ds  = MRIDataset2D(df=df_test,is_train=True,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols)
+            train_ds = MRIDataset2D(df=df_tr  ,is_train=True,use_augmentation=True, is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
+            val_ds   = MRIDataset2D(df=df_val ,is_train=True,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
+            test_ds  = MRIDataset2D(df=df_test,is_train=True,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
         else:
             train_ds = MRIDataset3D(df=df_tr  ,is_train=True,use_augmentation=True,labels=args.label_cols)
             val_ds   = MRIDataset3D(df=df_val ,is_train=True,use_augmentation=False,labels=args.label_cols)
@@ -212,7 +209,7 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
             model = Model3DResnet(num_labels=len(args.label_cols), num_classes=3,dropout_p=args.dropout_p,
                                         pretrained=True, freeze_backbone=False).to(args.device) 
 
-        grad_scaler          = torch.cuda.amp.GradScaler(enabled=True)
+        grad_scaler = torch.cuda.amp.GradScaler(enabled=True)
         optimizer = torch.optim.Adam(model.parameters(), lr= args.lr, weight_decay=args.weight_decay)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.95, patience=5, verbose=True)
         val_best_f1 = 0

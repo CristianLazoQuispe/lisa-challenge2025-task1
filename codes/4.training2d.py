@@ -74,6 +74,8 @@ def get_args():
     parser.add_argument("--n_splits", type=int, default=5)
     parser.add_argument("--in_channels", type=int, default=1)
     parser.add_argument("--is_numpy", type=int, default=0)
+    parser.add_argument("--image_size", type=int, default=224)
+    
     
     parser.add_argument("--label_cols", type=str, default="Noise,Zipper,Positioning,Banding,Motion,Contrast,Distortion")
 
@@ -125,7 +127,7 @@ if __name__ == "__main__":
         print(f"🧪 OOF saved at: {results['oof_path']}")
 
     if args.type_modeling == "2d":
-        test_ds = MRIDataset2D(df=df_test,is_train=False,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols)
+        test_ds = MRIDataset2D(df=df_test,is_train=False,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
     else:
         test_ds = MRIDataset3D(df=df_test,is_train=False,use_augmentation=False,labels=args.label_cols)
         
@@ -158,25 +160,28 @@ if __name__ == "__main__":
 
     """
     maxvit_tiny_tf_512.in1k
+    maxvit_nano_rw_256.sw_in1k
+    maxvit_tiny_rw_224.sw_in1k
 
     python 4.training2d.py \
-    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/maxvit_nano_rw_256.sw_in1k2D_final \
-    --experiment_name maxvit_nano_rw_256.sw_in1k2D_final \
+    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/maxvit_tiny_rw_224.sw_in1k2D_final \
+    --experiment_name maxvit_tiny_rw_224.sw_in1k2D_final \
     --batch_size 32 \
     --in_channels 1 \
     --mixup_prob 1 \
     --is_numpy 1 \
-    --base_model maxvit_nano_rw_256.sw_in1k \
+    --image_size 224 \
+    --base_model maxvit_tiny_rw_224.sw_in1k \
     --loss_name focal_loss \
     --use_manual_weights 1 \
     --epochs 2000 \
     --patience 10 \
     --type_modeling 2d \
-    --device cuda:5 \
+    --device cuda:4 \
     --lr 1e-5 \
     --weight_decay 1e-3 \
     --use_sampling 0 \
-    --num_workers 64 \
+    --num_workers 8 \
     --n_splits 3
 
     """
