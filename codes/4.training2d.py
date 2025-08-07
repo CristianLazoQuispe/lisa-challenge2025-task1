@@ -1,38 +1,29 @@
-import os
-import argparse
 import pandas as pd
-import torch
-from pathlib import Path
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-
-from assign_robust_folds import assign_robust_folds
-from train_with_robust_csv import train_with_cv
-from inference_model import inference_model
-from ensemble import ensemble_probs_from_files
-from dataset import MRI2DOrdinalDataset,MRI3DOrdinalDataset
-from torchvision import transforms
-from models import SwinOrdinalClassifier
-from sklearn.model_selection import train_test_split
-import wandb
-from my_wandb import init_wandb
 import numpy as np
-
-import os
-import sys
-parent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
-sys.path.append(parent_path)
-
-from src.models.video3d18 import Videor3d18Classifier
-
-
-import time
-import gc
 import traceback
+import argparse
 import atexit
 import torch
-import numpy as np
-import random
+import wandb
+import time
+import sys
+import gc
+import os
+
+sys.path.append("../")
+
+from src.dataset2D import MRIDataset2D
+from src.dataset3D import MRIDataset3D
+from src.models2D import Model2DTimm
+from src.models3D import Model3DResnet
+from src.mywandb import init_wandb
+from src import utils
+from src import trainer
+
+from src.inference_model import inference_model
+from src.ensemble import ensemble_probs_from_files
+from torchvision import transforms
+
 
 # Torch Settings
 torch.backends.cuda.enable_mem_efficient_sdp(False)
@@ -74,8 +65,9 @@ def get_args():
     parser.add_argument("--experiment_name", type=str, default="2d_prediction")
     parser.add_argument("--tag_wandb", type=str, default="2d")
     parser.add_argument("--type_modeling", type=str, default="2d or 3d")    
-    parser.add_argument("--train_csv", type=str, default="../../results/preprocessed_data/df_train_imagesNEW4x4_nativev2.csv")
-    parser.add_argument("--test_csv", type=str, default="../../results/preprocessed_data/df_test_imagesNEW4x4_nativev2.csv")
+    parser.add_argument("--train_original_csv", type=str, default="../results/preprocessed_data/df_train.csv")
+    parser.add_argument("--train_csv", type=str, default="../results/preprocessed_data/df_train_imgs.csv")
+    parser.add_argument("--test_csv", type=str, default="../results/preprocessed_data/df_test_imgs.csv")
     parser.add_argument("--save_dir", type=str, default="./results/")
     parser.add_argument("--base_model", type=str, default="vit_tiny_patch16_224.augreg_in21k")
     
@@ -111,49 +103,37 @@ if __name__ == "__main__":
     os.makedirs(args.save_dir, exist_ok=True)
 
     # 📄 Leer CSVs
+    df_train_original = pd.read_csv(args.train_original_csv)
+
     df_train = pd.read_csv(args.train_csv)
     df_test  = pd.read_csv(args.test_csv)
+    df_train["patient_id"] = df_train["filename"].str.extract(r"(LISA_\d+)")
+    df_test["patient_id"]   = df_test["filename"].str.extract(r"(LISA_VALIDATION_\d+)")
 
     # 🎯 Clases
     args.label_cols = args.label_cols.split(",")
 
-
-    # Back testing
-    df_all = df_train.copy()
-    df_all["patient_id"] = df_all["filename"].str.extract(r"(LISA_\d+)")
-    train_ids, test_ids = train_test_split(df_all["patient_id"].unique(), test_size=0.1, random_state=args.seed, shuffle=True)
-    df_train      = df_all[df_all["patient_id"].isin(train_ids)].reset_index(drop=True)
-    df_test_back  = df_all[df_all["patient_id"].isin(test_ids)].reset_index(drop=True)
-    
-    # 🧠 Asignar folds robustos
-    df_train = assign_robust_folds(df_train, n_splits=args.n_splits, top_k=2, seed=42)
-
-    for i, label in enumerate(args.label_cols):
-        y = df_train[label].values
-        print(f"Train    : {label} true dist: {np.bincount(y, minlength=3)}")
-    for i, label in enumerate(args.label_cols):
-        y = df_test_back[label].values
-        print(f"Testback : {label} true dist: {np.bincount(y, minlength=3)}")
+    df_train,df_test_back = utils.robust_split_by_patient(df_train_original,df_train,args)
 
     results = {}
     if True:
         # 🚀 Entrenar y evaluar
         print("df_test_back:",df_test_back.shape)
-        results = train_with_cv(df_train, df_test_back, args.label_cols, args,save_dir = args.save_dir)
+        results = trainer.train_with_cv(df_train, df_test_back, args.label_cols, args,save_dir = args.save_dir)
 
         print(f"\n✅ Done. CV F1 Macro: {results['test_oof_f1_macro']:.4f}")
         print(f"🧪 OOF saved at: {results['oof_path']}")
 
     if args.type_modeling == "2d":
-        test_ds = MRI2DOrdinalDataset(df_test, is_train=False, transform=val_tf,is_numpy=args.is_numpy,labels=args.label_cols)
+        test_ds = MRIDataset2D(df=df_test,is_train=False,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols)
     else:
-        test_ds = MRI3DOrdinalDataset(df_test, is_train=False, transform=val_tf)
+        test_ds = MRIDataset3D(df=df_test,is_train=False,use_augmentation=False,labels=args.label_cols)
         
     if args.type_modeling == "2d":
-        model = SwinOrdinalClassifier(base_model=args.base_model,in_channels=args.in_channels,num_labels=len(args.label_cols),
+        model = Model2DTimm(base_model=args.base_model,in_channels=args.in_channels,num_labels=len(args.label_cols),
                                       num_classes=3,dropout_p=args.dropout_p).to(args.device)
     else:
-        model = Videor3d18Classifier(num_labels=len(args.label_cols), num_classes=3,dropout_p=args.dropout_p,
+        model = Model3DResnet(num_labels=len(args.label_cols), num_classes=3,dropout_p=args.dropout_p,
                                       pretrained=True, freeze_backbone=False).to(args.device) 
 
     csvs = []
@@ -174,3 +154,29 @@ if __name__ == "__main__":
 
     finish_process()
 
+
+
+    """
+    maxvit_tiny_tf_512.in1k
+
+    python 4.training2d.py \
+    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/maxvit_nano_rw_256.sw_in1k2D_final \
+    --experiment_name maxvit_nano_rw_256.sw_in1k2D_final \
+    --batch_size 32 \
+    --in_channels 1 \
+    --mixup_prob 1 \
+    --is_numpy 1 \
+    --base_model maxvit_nano_rw_256.sw_in1k \
+    --loss_name focal_loss \
+    --use_manual_weights 1 \
+    --epochs 2000 \
+    --patience 10 \
+    --type_modeling 2d \
+    --device cuda:5 \
+    --lr 1e-5 \
+    --weight_decay 1e-3 \
+    --use_sampling 0 \
+    --num_workers 64 \
+    --n_splits 3
+
+    """

@@ -90,4 +90,4 @@ class MRIDataset3D(Dataset):
             label = torch.tensor(row[self.labels].values.astype(np.int64))
             return image, label,row["filename"],view_onehot
         else:
-            return image,None, row["filename"],view_onehot
+            return image,-1, row["filename"],view_onehot
