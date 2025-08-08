@@ -1,4 +1,7 @@
 import pandas as pd
+from sklearn.metrics import f1_score
+
+import pandas as pd
 import numpy as np
 import traceback
 import argparse
@@ -20,6 +23,7 @@ from src.mywandb import init_wandb
 from src import utils
 from src import trainer
 from src import filtering
+from src import aggregations_preds
 from src.inference_model import inference_model
 from src.ensemble import ensemble_probs_from_files
 from torchvision import transforms
@@ -143,7 +147,7 @@ if __name__ == "__main__":
     df_train,df_test_back = utils.robust_split_by_patient(df_train_original,df_train,args)
 
     results = {}
-    if True:
+    if False:
         # 🚀 Entrenar y evaluar
         print("df_test_back:",df_test_back.shape)
         results = trainer.train_with_cv(df_train, df_test_back, args.label_cols, args,save_dir = args.save_dir)
@@ -152,6 +156,7 @@ if __name__ == "__main__":
         print(f"🧪 OOF saved at: {results['oof_path']}")
 
     if args.type_modeling == "2d":
+        test_back_ds = MRIDataset2D(df=df_test_back,is_train=False,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
         test_ds = MRIDataset2D(df=df_test,is_train=False,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
     else:
         test_ds = MRIDataset3D(df=df_test,is_train=False,use_augmentation=False,labels=args.label_cols)
@@ -163,15 +168,71 @@ if __name__ == "__main__":
         model = Model3DResnet(num_labels=len(args.label_cols), num_classes=3,dropout_p=args.dropout_p,
                                       pretrained=True, freeze_backbone=False).to(args.device) 
 
+    method = "probs"
+    maxi_f1_macro = 0
+    better_thr = None
+    for method in ["probs","label"]:
+        if method == "probs":
+            list_thr = [[0.10,0.30]]
+        
+        else:
+            list_thr = [[0.01,0.50],[0.10,0.50],[0.2,0.50],[0.3,0.50],[0.4,0.50],[0.5,0.50],[0.5,0.60],[0.5,0.70]] #[0.4,0.50]
+            list_thr = [[0.01,0.2],[0.10,0.2],[0.2,0.2],[0.3,0.2],[0.4,0.2],[0.5,0.2],[0.5,0.7],
+                        [0.01,0.3],[0.10,0.3],[0.2,0.3],[0.3,0.3],[0.4,0.3],[0.5,0.3],[0.5,0.8],
+                        [0.01,0.4],[0.10,0.4],[0.2,0.4],[0.3,0.4],[0.4,0.4],[0.5,0.4],[0.5,0.9],
+                        [0.01,0.6],[0.10,0.6],[0.2,0.6],[0.3,0.6],[0.4,0.6],[0.5,0.6],[0.5,1.0]] #[0.4,0.3]
+            list_thr = [[0.4,0.3]]
+        for thr2,thr1 in list_thr:
+            print("*"*10)
+            print(method, " thr2,thr1", thr2,thr1)
+            csvs = []
+            for fold in range(args.n_splits):
+                model.load_state_dict(torch.load(f"{args.save_dir}/model_fold{fold}.pt"))
+                df_probs = inference_model(model, test_back_ds, label_cols=args.label_cols, device=args.device,args=args,method=method,thr2=thr2, thr1=thr1)
+                df_probs.to_csv(f"{args.save_dir}/test_back_probs_fold{fold}.csv", index=False)
+                print("df_probs:",df_probs.shape)
+                # Ensemble
+                csvs.append(f"{args.save_dir}/test_back_probs_fold{fold}.csv")
+            if method == "probs":
+                df_probs, df_preds = ensemble_probs_from_files(csvs, args.label_cols, save_preds_path=f"{args.save_dir}/ensemble_test_back_submission.csv")
+            else:
+                df_probs, df_preds = aggregations_preds.ensemble_mode_and_mean_probs(csvs,  args.label_cols, 
+                                                                                save_preds_path=f"{args.save_dir}/ensemble_test_back_submission.csv",thr2=thr2, thr1=thr1)
+
+            # Asegurar que el orden de columnas sea igual
+            df_test_back_unique = df_test_back.drop_duplicates(subset=["filename"]).reset_index(drop=True)
+            y_true = df_test_back_unique[args.label_cols].values
+            y_pred = df_preds[args.label_cols].values
+            print(y_true.shape)
+            print(y_pred.shape)
+            f1_per_label_dict = {}
+            for i, col in enumerate(args.label_cols):
+                f1_per_label_dict[col] = f1_score(y_true[:, i], y_pred[:, i], average='macro')
+
+            f1_macro = sum(f1_per_label_dict.values()) / len(f1_per_label_dict)
+            f1_micro = f1_score(y_true.ravel(), y_pred.ravel(), average='micro')
+
+            print("F1 por etiqueta:", f1_per_label_dict)
+            print("F1 macro:", f1_macro)
+            print("F1 micro:", f1_micro)
+            if f1_macro>maxi_f1_macro:
+                maxi_f1_macro = f1_macro
+                better_thr = [thr2,thr1, f1_macro,f1_micro,f1_per_label_dict]
+
+    print("better_thr:",better_thr)
     csvs = []
     for fold in range(args.n_splits):
         model.load_state_dict(torch.load(f"{args.save_dir}/model_fold{fold}.pt"))
-        df_probs = inference_model(model, test_ds, label_cols=args.label_cols, device=args.device)
+        df_probs = inference_model(model, test_ds, label_cols=args.label_cols, device=args.device,args=args,method=method,thr2=thr2, thr1=thr1)
         df_probs.to_csv(f"{args.save_dir}/test_probs_fold{fold}.csv", index=False)
 
         # Ensemble
         csvs.append(f"{args.save_dir}/test_probs_fold{fold}.csv")
-    df_probs, df_preds = ensemble_probs_from_files(csvs, args.label_cols, save_preds_path=f"{args.save_dir}/ensemble_submission.csv")
+    if method == "probs":
+        df_probs, df_preds = ensemble_probs_from_files(csvs, args.label_cols, save_preds_path=f"{args.save_dir}/ensemble_submission.csv")
+    else:
+        df_probs, df_preds = aggregations_preds.ensemble_mode_and_mean_probs(csvs,  args.label_cols, 
+                                                                        save_preds_path=f"{args.save_dir}/ensemble_submission.csv",thr2=thr2, thr1=thr1)
 
     run = init_wandb(args,f"{args.experiment_name}")
     log_values = results
