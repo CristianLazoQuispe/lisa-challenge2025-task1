@@ -20,6 +20,51 @@ from . import utils
 
 from collections import deque
 import numpy as np
+from torch.utils.data import DataLoader, WeightedRandomSampler
+
+def epoch_subsample(df, frac=0.5, seed=None):
+    # Submuestrea dentro de cada paciente sin el warning
+    return (
+        df.groupby("patient_id", group_keys=False)
+          .sample(frac=frac, random_state=seed)
+          .reset_index(drop=True)
+    )
+
+def apply_label_smoothing(y, smoothing=0.05, num_classes=3):
+    """Convierte etiquetas one-hot a suavizadas."""
+    with torch.no_grad():
+        y_smooth = torch.full_like(y, smoothing / (num_classes - 1))
+        y_smooth.scatter_(1, y.argmax(dim=1, keepdim=True), 1.0 - smoothing)
+    return y_smooth
+
+def cutmix_data(x, y, alpha=1.0):
+    """Aplicar CutMix."""
+    lam = np.random.beta(alpha, alpha)
+    rand_index = torch.randperm(x.size()[0]).to(x.device)
+
+    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
+    x[:, :, bbx1:bbx2, bby1:bby2] = x[rand_index, :, bbx1:bbx2, bby1:bby2]
+
+    y_a, y_b = y, y[rand_index]
+    return x, y_a, y_b, lam
+
+def rand_bbox(size, lam):
+    """Generar caja aleatoria para CutMix."""
+    W = size[2]
+    H = size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    return bbx1, bby1, bbx2, bby2
 
 
 class SlidingWindowAverage:
@@ -152,7 +197,13 @@ def update_optimizer(model,optimizer, grad_scaler, clip_grad_max_norm,lr_schedul
 def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
     os.makedirs(args.save_dir, exist_ok=True)
     logging.basicConfig(filename=f"{args.save_dir}/training.log", level=logging.INFO)
-    weights_per_label = utils.compute_weights_from_df(df_train, use_manual = bool(args.use_manual_weights))
+    weights_per_label = utils.compute_weights_from_df(df_train,args.label_cols,args.weight_method,
+    args.weight_beta,          # para "effective"
+    args.weight_alpha,          # para "invfreq"
+    args.weight_cap,            # para "invfreq"
+    args.device,
+    dtype=torch.float32)
+    
     print("weights_per_label:",weights_per_label)
     criterions = get_per_label_criterions(label_cols, weights_per_label, args)
 
@@ -160,6 +211,7 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
     test_oof_records = []
     test_preds_accum = []
     fold_scores = []
+    log_values = {}
     for fold in range(args.n_splits):
         logging.info(f"🔁 Fold {fold}")
         run = init_wandb(args,f"{args.experiment_name}:f{fold}")
@@ -168,6 +220,15 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
         df_tr = df_train[df_train.fold != fold]
         df_val = df_train[df_train.fold == fold]
 
+        ids_counts = df_tr["patient_id"].value_counts()
+        ids_train  = ids_counts.index.tolist()
+        df_common = df_val[df_val["patient_id"].isin(ids_train)].copy()
+        print(f"train  : {df_train.shape}")
+        print(f"df_tr  : {df_tr.shape}")
+        print(f"df_val : {df_val.shape}")
+        print(f"Train Test fold {fold} Casos comunes: {len(df_common)}")
+
+        #raise
 
         for i, label in enumerate(label_cols):
             y = df_tr[label].values
@@ -178,29 +239,19 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
             print(f"Val {label} true dist: {np.bincount(y, minlength=3)}")
 
         window_f1 = SlidingWindowAverage(window_size=5)
+        df_tr_full = df_tr.copy()
+
         # Dataset
         if args.type_modeling == "2d":
-            train_ds = MRIDataset2D(df=df_tr  ,is_train=True,use_augmentation=True, is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
             val_ds   = MRIDataset2D(df=df_val ,is_train=True,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
             test_ds  = MRIDataset2D(df=df_test,is_train=True,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
         else:
-            train_ds = MRIDataset3D(df=df_tr  ,is_train=True,use_augmentation=True,labels=args.label_cols)
             val_ds   = MRIDataset3D(df=df_val ,is_train=True,use_augmentation=False,labels=args.label_cols)
             test_ds  = MRIDataset3D(df=df_test,is_train=True,use_augmentation=False,labels=args.label_cols)
 
-        #"""
-        # Sampler sin alterar distribución del dataset
-        if bool(args.use_sampling):
-            print("USING use_sampling")
-            weights = utils.compute_sample_weights(df_tr, label_cols)
-            sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
-            train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers)
-        else:
-            print("NO use_sampling")
-            train_loader = DataLoader(train_ds, batch_size=args.batch_size,  shuffle=True, num_workers=args.num_workers, persistent_workers=True)
-
         val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, persistent_workers=True)
         test_loader  = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, persistent_workers=True)
+
 
         if args.type_modeling == "2d":
             model = Model2DTimm(base_model=args.base_model,in_channels=args.in_channels,num_labels=len(args.label_cols),
@@ -211,11 +262,37 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
 
         grad_scaler = torch.cuda.amp.GradScaler(enabled=True)
         optimizer = torch.optim.Adam(model.parameters(), lr= args.lr, weight_decay=args.weight_decay)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.95, patience=5, verbose=True)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.95, patience=5)
+
+
         val_best_f1 = 0
         patience = args.patience
         step = 0
         for epoch in range(args.epochs):
+
+            df_tr = epoch_subsample(df_tr_full, frac=args.slice_frac, seed=epoch)
+            print(f"df_tr recortado: {df_tr.shape}")
+
+            #for i, label in enumerate(label_cols):
+            #    y = df_tr[label].values
+            #    print(f"epoch {epoch} Train {label} true dist: {np.bincount(y, minlength=3)}")
+
+
+            # Dataset
+            if args.type_modeling == "2d":
+                train_ds = MRIDataset2D(df=df_tr  ,is_train=True,use_augmentation=True, is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
+            else:
+                train_ds = MRIDataset3D(df=df_tr  ,is_train=True,use_augmentation=True,labels=args.label_cols)
+            #"""
+            # Sampler sin alterar distribución del dataset
+            if bool(args.use_sampling):
+                print("USING use_sampling")
+                weights = utils.compute_sample_weights(df_tr, label_cols)
+                sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+                train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers)
+            else:
+                print("NO use_sampling")
+                train_loader = DataLoader(train_ds, batch_size=args.batch_size,  shuffle=True, num_workers=args.num_workers, persistent_workers=True)
 
             loss_log_values = {}
             for i, label in enumerate(label_cols):
@@ -228,12 +305,20 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
                 view = view.to(args.device)
                 with torch.cuda.amp.autocast():
 
-                    if random.random() < args.mixup_prob:
-                        x,view, y_a, y_b, lam = mixup_data(x,view, y, alpha=args.mixup_alpha)
+                    # Alternancia Mixup / CutMix
+                    r = random.random()
+                    if r < args.mixup_prob:
+                        x, view, y_a, y_b, lam = mixup_data(x, view, y, alpha=args.mixup_alpha)
                         y_hat = model(x)
                         loss = sum(lam * criterions[i](y_hat[:, i], y_a[:, i]) +
-                                (1 - lam) * criterions[i](y_hat[:, i], y_b[:, i])
-                                for i in range(len(label_cols))) / len(label_cols)
+                                   (1 - lam) * criterions[i](y_hat[:, i], y_b[:, i])
+                                   for i in range(len(label_cols))) / len(label_cols)
+                    elif r < args.mixup_prob + args.cutmix_prob:
+                        x, y_a, y_b, lam = cutmix_data(x, y, alpha=args.cutmix_alpha)
+                        y_hat = model(x)
+                        loss = sum(lam * criterions[i](y_hat[:, i], y_a[:, i]) +
+                                   (1 - lam) * criterions[i](y_hat[:, i], y_b[:, i])
+                                   for i in range(len(label_cols))) / len(label_cols)
                     else:
                         y_hat = model(x)
                         loss = sum(criterions[i](y_hat[:, i], y[:, i]) for i in range(len(label_cols))) / len(label_cols)
@@ -345,7 +430,6 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
 
         # ✅ OOF pred con el mejor modelo
         fold_scores.append({"fold": fold, "val_f1": val_best_f1})
-        wandb.finish()
 
         print(f"🔁 Loading best model for fold {fold}")
         model.load_state_dict(torch.load(f"{save_dir}/model_fold{fold}.pt"))
@@ -358,6 +442,12 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
         y_pred_test,y_prod_val,y_true_test,test_files = inference_dataset(test_loader,model,args)
         for yp, yt, f in zip(y_pred_test, y_true_test, test_files):
             test_oof_records.append({**{l: yp[i] for i, l in enumerate(args.label_cols)}, "filename": f})
+        test_results = get_metrics(df_test,test_oof_records,args,prefix="test_oof_")
+        log_values.update(test_results)
+        wandb.log(log_values, step=step)
+
+        if fold < (args.n_splits-1):
+            wandb.finish()
 
     val_results  = get_metrics(df_train,val_oof_records,args,prefix="val_oof_")
     test_results = get_metrics(df_test,test_oof_records,args,prefix="test_oof_")
@@ -375,6 +465,11 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
 
     final_results.update(val_results)
     final_results.update(test_results)
+
+    log_values.update(final_results)
+    wandb.log(log_values, step=step)
+    wandb.finish()
+
     return final_results
 
 

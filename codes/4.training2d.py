@@ -19,7 +19,7 @@ from src.models3D import Model3DResnet
 from src.mywandb import init_wandb
 from src import utils
 from src import trainer
-
+from src import filtering
 from src.inference_model import inference_model
 from src.ensemble import ensemble_probs_from_files
 from torchvision import transforms
@@ -74,6 +74,11 @@ def get_args():
     parser.add_argument("--threshold_brain_presence", type=float, default=0)
     parser.add_argument("--n_splits", type=int, default=5)
     parser.add_argument("--in_channels", type=int, default=1)
+    parser.add_argument("--slice_frac", type=float, default=0.3)
+    parser.add_argument("--label_smoothing", type=float, default=0.05)
+    parser.add_argument("--focal_gamma", type=float, default=2.0)
+    
+    
     parser.add_argument("--is_numpy", type=int, default=0)
     parser.add_argument("--image_size", type=int, default=224)
     
@@ -87,8 +92,18 @@ def get_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--dropout_p", type=float, default=0.3)
-    parser.add_argument("--mixup_prob", type=float, default=0.5)
+
+    parser.add_argument("--weight_method", type=str, default="effective",
+                        choices=["effective", "invfreq","manual"],help="Método para calcular class weights: 'effective' (CB-Focal) o 'invfreq'")
+    parser.add_argument("--weight_beta", type=float, default=0.99, help="Parámetro beta para método 'effective'")
+    parser.add_argument("--weight_alpha", type=float, default=0.5, help="Parámetro alpha para método 'invfreq'")
+    parser.add_argument("--weight_cap", type=float, default=8.0,help="Cap máximo para pesos en método 'invfreq'")
+
+    parser.add_argument("--mixup_prob", type=float, default=1.0)
     parser.add_argument("--mixup_alpha", type=float, default=0.4)
+    parser.add_argument("--cutmix_prob", type=float, default=0.3)
+    parser.add_argument("--cutmix_alpha", type=float, default=1.0)
+
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_sampling", type=int, default=1)
     parser.add_argument("--device", type=str, default="cuda:5" if torch.cuda.is_available() else "cpu")
@@ -116,6 +131,12 @@ if __name__ == "__main__":
     df_train = df_train[df_train["ratio"]>=args.threshold_brain_presence].reset_index()
     df_test  = df_test[df_test["ratio"]>=args.threshold_brain_presence].reset_index()
     
+    print(f"Original: {df_train.shape}")
+    df_train = filtering.filter_dataset_by_similarity_ssim(df_train, ssim_thresh=0.85)
+    print(f"→ Filtrado: {df_train.shape}")
+
+    #raise
+
     # 🎯 Clases
     args.label_cols = args.label_cols.split(",")
 
@@ -167,26 +188,31 @@ if __name__ == "__main__":
     maxvit_nano_rw_256.sw_in1k
     maxvit_tiny_rw_224.sw_in1k
 
+
     python 4.training2d.py \
-    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/maxvit_nano_rw_256.sw_in1k2D_finalratio0.1 \
-    --experiment_name maxvit_nano_rw_256.sw_in1k2D_finalratio0.1 \
-    --threshold_brain_presence 0.1 \
-    --batch_size 32 \
+    --device cuda:4 \
+    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/maxvit_nano_rw_256_flv3_8_0.1 \
+    --experiment_name maxvit_nano_rw_256_flv3_8_0.1 \
+    --loss_name focal_lossv3 \
+    --slice_frac 0.1 \
+    --threshold_brain_presence 0.2 \
+    --batch_size 8 \
     --in_channels 1 \
-    --mixup_prob 1 \
     --is_numpy 1 \
     --image_size 256 \
     --base_model maxvit_nano_rw_256.sw_in1k \
-    --loss_name focal_loss \
-    --use_manual_weights 1 \
+    --focal_gamma 1.5 \
+    --weight_method manual \
+    --weight_beta 0.9 \
+    --label_smoothing 0.05 \
     --epochs 2000 \
-    --patience 10 \
+    --patience 20 \
     --type_modeling 2d \
-    --device cuda:3 \
     --lr 1e-5 \
     --weight_decay 1e-3 \
     --use_sampling 0 \
     --num_workers 8 \
     --n_splits 3
 
+    
     """

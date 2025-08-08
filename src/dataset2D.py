@@ -34,21 +34,22 @@ def get_aug_transforms(image_size):
 
             A.OneOf([
                 # 🔎 Zoom + desplazamiento leve
-                A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=1.0),
+                #A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+                A.Affine(scale=(0.8, 1.2), translate_percent=(0.0, 0.1), rotate=(-15, 15), p=1.0),
                 # 🔳 Apagar zonas aleatorias (simula distorsión visual o falta de señal)
-                A.CoarseDropout(max_holes=2, max_height=50, max_width=50, fill_value=0, p=1.0),
+                A.CoarseDropout(num_holes_range=(1,2), hole_height_range=(0.1, 0.2), hole_width_range=(0.1, 0.2), fill=0, p=1.0),
                 # 🖼️ Zoom tipo crop + resize (cambia FOV)
-                A.RandomResizedCrop(size=(image_size, image_size), scale=(0.85, 1.0), ratio=(0.9, 1.1), p=1.0),
+                A.RandomResizedCrop(size=(image_size, image_size), scale=(0.8, 1.0), ratio=(0.7, 1.3), p=1.0),
             ], p=0.33),
 
             A.OneOf([
-                A.GaussNoise(std_range=(0, 1e-1), mean_range=(0,1e-4), p=1.0),   # ruido muy leve
-                A.GaussianBlur(blur_limit=(1,3), p=1.0),                # desenfoque apenas perceptible
-                A.MedianBlur(blur_limit=(1,3), p=1.0),
+                A.GaussNoise(std_range=(1e-5, 2e-1), mean_range=(0,1e-4), p=1.0),   # ruido muy leve
+                A.GaussianBlur(sigma_limit= (0.5,5), blur_limit=(3,20), p=1.0),                # desenfoque apenas perceptible
+                A.MedianBlur(blur_limit=(3,21), p=1.0),
             ], p=0.33),
 
             A.OneOf([
-                A.MultiplicativeNoise(multiplier=(0.95, 1.1), p=1.0),   # cambia el contraste levemente
+                A.MultiplicativeNoise(multiplier=(0.95, 1.2), p=1.0),   # cambia el contraste levemente
                 A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1,p=1.0),
                 A.CLAHE(clip_limit=2,p=1.0),
             ], p=0.33),
