@@ -1,0 +1,141 @@
+wandb_version: 1
+
+train_csv:
+  desc: null
+  value: ../../results/preprocessed_data/df_train_imgs.csv
+test_csv:
+  desc: null
+  value: ../../results/preprocessed_data/df_test_imgs.csv
+test_back_csv:
+  desc: null
+  value: null
+save_dir:
+  desc: null
+  value: /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/lisa_clean
+experiment_name:
+  desc: null
+  value: lisa_experiment
+n_splits:
+  desc: null
+  value: 3
+batch_size:
+  desc: null
+  value: 16
+epochs:
+  desc: null
+  value: 3
+patience:
+  desc: null
+  value: 5
+lr:
+  desc: null
+  value: 0.0001
+weight_decay:
+  desc: null
+  value: 0.0001
+base_model:
+  desc: null
+  value: maxvit_nano_rw_256.sw_in1k
+head_type:
+  desc: null
+  value: label_tokens
+use_view:
+  desc: null
+  value: true
+pretrained:
+  desc: null
+  value: 1
+image_size:
+  desc: null
+  value: 256
+in_channels:
+  desc: null
+  value: 1
+slice_frac:
+  desc: null
+  value: 1.0
+use_sampling:
+  desc: null
+  value: 1
+num_workers:
+  desc: null
+  value: 4
+device:
+  desc: null
+  value: cuda:4
+weight_method:
+  desc: null
+  value: effective
+weight_beta:
+  desc: null
+  value: 0.99
+weight_alpha:
+  desc: null
+  value: 0.5
+weight_cap:
+  desc: null
+  value: 8.0
+head_config:
+  desc: null
+  value: null
+aggregators:
+  desc: null
+  value:
+  - mean
+  - vote
+  - max
+  - weighted
+seed:
+  desc: null
+  value: 42
+scheduler_patience:
+  desc: null
+  value: 5
+log_interval:
+  desc: null
+  value: 50
+do_inference:
+  desc: null
+  value: false
+_wandb:
+  desc: null
+  value:
+    python_version: 3.9.21
+    cli_version: 0.17.1
+    framework: huggingface
+    huggingface_version: 4.41.0
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1754719670
+    t:
+      1:
+      - 1
+      - 5
+      - 11
+      - 41
+      - 49
+      - 53
+      - 55
+      - 63
+      - 80
+      - 105
+      2:
+      - 1
+      - 5
+      - 11
+      - 41
+      - 49
+      - 53
+      - 55
+      - 63
+      - 80
+      - 105
+      3:
+      - 16
+      - 23
+      4: 3.9.21
+      5: 0.17.1
+      6: 4.41.0
+      8:
+      - 5
+      13: linux-x86_64
