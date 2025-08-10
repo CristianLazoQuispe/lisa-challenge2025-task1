@@ -14,6 +14,7 @@ import gc
 import os
 
 sys.path.append("../")
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from src.dataset2D import MRIDataset2D
 from src.dataset3D import MRIDataset3D
@@ -132,11 +133,11 @@ if __name__ == "__main__":
     df_train["patient_id"] = df_train["filename"].str.extract(r"(LISA_\d+)")
     df_test["patient_id"]  = df_test["filename"].str.extract(r"(LISA_VALIDATION_\d+)")
     
-    df_train = df_train[df_train["ratio"]>=args.threshold_brain_presence].reset_index()
-    df_test  = df_test[df_test["ratio"]>=args.threshold_brain_presence].reset_index()
+    #df_train = df_train[df_train["ratio"]>=args.threshold_brain_presence].reset_index()
+    #df_test  = df_test[df_test["ratio"]>=args.threshold_brain_presence].reset_index()
     
     print(f"Original: {df_train.shape}")
-    df_train = filtering.filter_dataset_by_similarity_ssim(df_train, ssim_thresh=0.85)
+    df_train = filtering.filter_dataset_by_similarity_ssim(df_train, ssim_thresh=0.7)
     print(f"→ Filtrado: {df_train.shape}")
 
     #raise
@@ -147,7 +148,7 @@ if __name__ == "__main__":
     df_train,df_test_back = utils.robust_split_by_patient(df_train_original,df_train,args)
 
     results = {}
-    if False:
+    if True:
         # 🚀 Entrenar y evaluar
         print("df_test_back:",df_test_back.shape)
         results = trainer.train_with_cv(df_train, df_test_back, args.label_cols, args,save_dir = args.save_dir)
@@ -168,6 +169,7 @@ if __name__ == "__main__":
         model = Model3DResnet(num_labels=len(args.label_cols), num_classes=3,dropout_p=args.dropout_p,
                                       pretrained=True, freeze_backbone=False).to(args.device) 
 
+    test_loader  = DataLoader(test_back_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, persistent_workers=True)
     method = "probs"
     maxi_f1_macro = 0
     better_thr = None
@@ -176,19 +178,35 @@ if __name__ == "__main__":
             list_thr = [[0.10,0.30]]
         
         else:
-            list_thr = [[0.01,0.50],[0.10,0.50],[0.2,0.50],[0.3,0.50],[0.4,0.50],[0.5,0.50],[0.5,0.60],[0.5,0.70]] #[0.4,0.50]
-            list_thr = [[0.01,0.2],[0.10,0.2],[0.2,0.2],[0.3,0.2],[0.4,0.2],[0.5,0.2],[0.5,0.7],
+            list_thr = [[0.01,0.50],[0.10,0.50],[0.2,0.50],[0.3,0.50],[0.4,0.50],[0.5,0.50],[0.5,0.60],[0.5,0.70],
+                        [0.01,0.2],[0.10,0.2],[0.2,0.2],[0.3,0.2],[0.4,0.2],[0.5,0.2],[0.5,0.7],
                         [0.01,0.3],[0.10,0.3],[0.2,0.3],[0.3,0.3],[0.4,0.3],[0.5,0.3],[0.5,0.8],
                         [0.01,0.4],[0.10,0.4],[0.2,0.4],[0.3,0.4],[0.4,0.4],[0.5,0.4],[0.5,0.9],
                         [0.01,0.6],[0.10,0.6],[0.2,0.6],[0.3,0.6],[0.4,0.6],[0.5,0.6],[0.5,1.0]] #[0.4,0.3]
-            list_thr = [[0.4,0.3]]
+            list_thr = [[1,1]] #0.1,0.3]]
         for thr2,thr1 in list_thr:
             print("*"*10)
             print(method, " thr2,thr1", thr2,thr1)
             csvs = []
-            for fold in range(args.n_splits):
+            for fold in range(1):#args.n_splits):
                 model.load_state_dict(torch.load(f"{args.save_dir}/model_fold{fold}.pt"))
-                df_probs = inference_model(model, test_back_ds, label_cols=args.label_cols, device=args.device,args=args,method=method,thr2=thr2, thr1=thr1)
+                y_pred_test,y_prod_val,y_true_test,test_files = trainer.inference_dataset(test_loader,model,args)
+                test_oof_records = []
+                for yp, yt, f in zip(y_pred_test, y_true_test, test_files):
+                    test_oof_records.append({**{l: yp[i] for i, l in enumerate(args.label_cols)}, "filename": f})
+                test_results = trainer.get_metrics(df_test_back,test_oof_records,args,prefix="test_oof_")
+                print(test_results)
+                records = []
+                for i in range(len(test_files)):
+                    row = {"filename": test_files[i]}
+                    for j, label in enumerate(args.label_cols):
+                        for k in range(3):
+                            row[f"{label}_{k}"] = y_prod_val[i, j, k]
+                        row[label] = y_pred_test[i, j]
+                    records.append(row)
+
+                df_probs = pd.DataFrame(records)
+                #df_probs = inference_model(model, test_back_ds, label_cols=args.label_cols, device=args.device,args=args,method=method,thr2=thr2, thr1=thr1)
                 df_probs.to_csv(f"{args.save_dir}/test_back_probs_fold{fold}.csv", index=False)
                 print("df_probs:",df_probs.shape)
                 # Ensemble
@@ -251,13 +269,13 @@ if __name__ == "__main__":
 
 
     python 4.training2d.py \
-    --device cuda:4 \
-    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/maxvit_nano_rw_256_flv3_8_0.1 \
-    --experiment_name maxvit_nano_rw_256_flv3_8_0.1 \
-    --loss_name focal_lossv3 \
-    --slice_frac 0.1 \
-    --threshold_brain_presence 0.2 \
-    --batch_size 8 \
+    --device cuda:5 \
+    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/maxvit_nano_rw_256_df_8_0.1_dynamicv2 \
+    --experiment_name maxvit_nano_rw_256_df_8_0.1_dynamicv2 \
+    --slice_frac 0.99 \
+    --loss_name dynamicv2 \
+    --threshold_brain_presence 0.0 \
+    --batch_size 16 \
     --in_channels 1 \
     --is_numpy 1 \
     --image_size 256 \
@@ -265,14 +283,14 @@ if __name__ == "__main__":
     --focal_gamma 1.5 \
     --weight_method manual \
     --weight_beta 0.9 \
-    --label_smoothing 0.05 \
+    --label_smoothing 0.2 \
     --epochs 2000 \
-    --patience 20 \
+    --patience 50 \
     --type_modeling 2d \
     --lr 1e-5 \
     --weight_decay 1e-3 \
-    --use_sampling 0 \
-    --num_workers 8 \
+    --use_sampling 1 \
+    --num_workers 16 \
     --n_splits 3
 
     

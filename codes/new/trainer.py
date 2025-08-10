@@ -59,14 +59,15 @@ import torch.nn as nn
 from sklearn.metrics import f1_score, accuracy_score
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
-import sys
-import gc
-import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 
-sys.path.append("../../")
 from dataset import MRIDataset2D
 from model import Model2DTimm
-from utils import assign_patient_stratified_folds, compute_weights_from_df, compute_sample_weights, set_seed
+from utils import (assign_patient_stratified_folds, assign_volume_stratified_folds,
+                    compute_weights_from_df, compute_sample_weights, set_seed)
 
 
 def softmax_logits(y_hat: torch.Tensor) -> torch.Tensor:
@@ -235,6 +236,26 @@ def aggregate_slices(results: List[Dict], num_labels: int, num_classes: int,
             y_true[i] = true_label
     return y_pred, y_prob, y_true, vol_names
 
+class DynamicFocalLoss(torch.nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super(DynamicFocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        prob = F.softmax(inputs, dim=1)
+        p_t = torch.gather(prob, 1, targets.unsqueeze(1)).squeeze()
+        alpha_t = self.alpha * (1 - p_t) ** self.gamma
+        focal_loss = alpha_t * ce_loss
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
 
 def evaluate_aggregators(results: List[Dict], label_cols: Iterable[str], num_classes: int = 3,
                          aggregators: Iterable[str] = ('mean', 'vote', 'max', 'weighted')) -> Dict[str, Dict]:
@@ -331,6 +352,49 @@ def evaluate_aggregators(results: List[Dict], label_cols: Iterable[str], num_cla
     return metrics
 
 
+def epoch_subsample_frac_unique_patients(df, frac=0.1, seed=None):
+    """
+    Selecciona un subconjunto de pacientes (frac del total) y 
+    devuelve exactamente un registro aleatorio por cada paciente seleccionado.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Lista de patient_id únicos y muestreo del frac
+    unique_patients = df["patient_id"].unique()
+    n_select = max(1, int(len(unique_patients) * frac))
+    selected_patients = rng.choice(unique_patients, size=n_select, replace=False)
+
+    # Filtrar DataFrame
+    df_selected = df[df["patient_id"].isin(selected_patients)]
+
+    # Elegir un registro aleatorio por paciente (sin warning)
+    df_sampled = (
+        df_selected.groupby("patient_id", group_keys=False, sort=False)
+                   .apply(lambda g: g.sample(n=5, random_state=seed, replace=True), include_groups=False)
+                   .reset_index(drop=True)
+    )
+
+    return df_sampled
+
+
+class DynamicFocalLoss2(nn.Module):
+    def __init__(self, alpha=(0.25, 0.75, 1.0), gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.register_buffer('alpha', alpha)
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs, targets):
+        # inputs: (B,3), targets: (B,)
+        ce = F.cross_entropy(inputs, targets, reduction='none')
+        prob = F.softmax(inputs, dim=1)
+        p_t = prob[torch.arange(prob.size(0), device=prob.device), targets]
+        alpha_t = self.alpha[targets]               # <-- por clase
+        loss = alpha_t * (1 - p_t) ** self.gamma * ce
+        return loss.mean() if self.reduction == 'mean' else loss.sum()
+
+
+
 def train_and_evaluate(train_df: pd.DataFrame,
                        test_back_df: Optional[pd.DataFrame],
                        label_cols: Iterable[str],
@@ -369,7 +433,26 @@ def train_and_evaluate(train_df: pd.DataFrame,
     n_splits = args.get('n_splits', 5)
     device   = torch.device(args.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
     # Assign folds
-    df = assign_patient_stratified_folds(train_df, n_splits=n_splits, seed=args.get('seed', 42))
+    # If the training DataFrame already contains a 'fold' column, use it directly.
+    # Otherwise, decide how to split: by volume or by patient depending on args.
+    if 'fold' in train_df.columns:
+        df = train_df.copy()
+        # Ensure fold values are integers and within range [0, n_splits-1]
+        if not pd.api.types.is_integer_dtype(df['fold']):
+            df['fold'] = df['fold'].astype(int)
+    else:
+        split_by_volume = args.get('split_by_volume', False)
+        volume_id_col = args.get('volume_id', 'patient_id')
+        if split_by_volume:
+            # Use volume-level stratified splitting
+            df = assign_volume_stratified_folds(train_df, volume_id_col=volume_id_col,
+                                                label_cols=label_cols,
+                                                n_splits=n_splits,
+                                                top_k=args.top_k,
+                                                seed=args.get('seed', 42))
+        else:
+            # Default: stratify by patient using rare labels
+            df = assign_patient_stratified_folds(train_df, n_splits=n_splits, seed=args.get('seed', 42))
     # Compute class weights per label
     weights = compute_weights_from_df(
         df, labels=label_cols,
@@ -384,7 +467,13 @@ def train_and_evaluate(train_df: pd.DataFrame,
     criterions: List[nn.Module] = []
     for lbl in label_cols:
         w = weights[lbl]
-        criterions.append(nn.CrossEntropyLoss(weight=w))
+        print(args.get('dynamic_w', "0.25, 0.75, 1.0"))
+        criterions.append(DynamicFocalLoss2(
+        alpha=torch.tensor([float(value) for value in args.get('dynamic_w', "0.25, 0.75, 1.0").split(",")], dtype=torch.float, device=device),
+        gamma=2.0)
+        )
+      #nn.CrossEntropyLoss(weight=w))
+        #criterions.append(DynamicFocalLoss(alpha=0.25, gamma=2.0)) #nn.CrossEntropyLoss(weight=w))
     # Logging with WandB
     # Determine if WandB logging is enabled via environment variables.  We will
     # create a new WandB run for each fold rather than one global run.  This
@@ -454,11 +543,14 @@ def train_and_evaluate(train_df: pd.DataFrame,
             # Optional slice fraction for each epoch
             if args.get('slice_frac', 1.0) < 1.0:
                 frac = args['slice_frac']
+                """
                 train_fold_ep = (
                     train_fold.groupby('patient_id', group_keys=False)
                         .sample(frac=frac, random_state=epoch)
                         .reset_index(drop=True)
-                )
+                )"""
+                train_fold_ep = epoch_subsample_frac_unique_patients(train_fold, frac=0.1, seed=None)
+
                 train_ds_ep = MRIDataset2D(train_fold_ep, is_train=True, use_augmentation=True,
                                            is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224))
                 if args.get('use_sampling', True):
@@ -492,16 +584,33 @@ def train_and_evaluate(train_df: pd.DataFrame,
                 nbatches += 1
                 # Do not log per batch.  Logging happens at the end of the epoch with a global step.
             epoch_loss = running_loss / max(1, nbatches)
-            # Validation at epoch end
-            # Collect per slice predictions on val set
+            # ------- Validation at epoch end -------
+            # 1) Compute slice‑level validation loss to compare with training loss.
+            model.eval()
+            val_loss_total = 0.0
+            n_val_batches = 0
+            with torch.no_grad():
+                for x_val, y_val, _, view_val in val_loader:
+                    x_val   = x_val.to(device, non_blocking=True)
+                    y_val   = y_val.to(device, non_blocking=True)
+                    view_val= view_val.to(device, non_blocking=True)
+                    with torch.cuda.amp.autocast():
+                        y_hat_val = model(x_val, view_val) if args.get('use_view', False) else model(x_val)
+                        loss_val = sum(
+                            criterions[i](y_hat_val[:, i], y_val[:, i]) for i in range(len(label_cols))
+                        ) / len(label_cols)
+                    val_loss_total += float(loss_val.item())
+                    n_val_batches += 1
+            val_loss_slice_level = val_loss_total / max(1, n_val_batches)
+            # 2) Collect per‑slice predictions on val set for aggregator evaluation
             val_results = collect_slice_predictions(val_loader, model, device)
             val_metrics = evaluate_aggregators(val_results, label_cols, num_classes=3, aggregators=aggregators)
-            # Choose mean aggregator to compute scheduler metric
+            # 3) Choose mean aggregator to compute scheduler metric
             val_f1 = val_metrics['mean']['f1_macro'] if 'mean' in val_metrics and 'f1_macro' in val_metrics['mean'] else 0.0
             scheduler.step(val_f1)
             # ------- Logging per epoch -------
             # Print a summary of validation metrics for each aggregator to the console
-            print(f"Fold {fold} Epoch {epoch}:", end=" ")
+            print(f"Fold {fold} Epoch {epoch} (train_loss={epoch_loss:.4f}, val_loss={val_loss_slice_level:.4f}):", end=" ")
             summary_strs = []
             for agg_name, m in val_metrics.items():
                 if 'f1_macro' in m:
@@ -513,13 +622,14 @@ def train_and_evaluate(train_df: pd.DataFrame,
                 log_data: Dict[str, float | int] = {
                     'epoch': epoch,
                     'train/loss': epoch_loss,
+                    'val/loss': val_loss_slice_level,
                 }
                 for agg_name, m in val_metrics.items():
                     if 'f1_macro' in m:
-                        log_data[f'val_{agg_name}_f1_macro'] = m['f1_macro']
-                        log_data[f'val_{agg_name}_f1_micro'] = m['f1_micro']
-                        log_data[f'val_{agg_name}_acc'] = m['acc']
-                        log_data[f'val_{agg_name}_loss_macro'] = m.get('loss_macro', 0.0)
+                        log_data[f'val_global/val_{agg_name}_f1_macro'] = m['f1_macro']
+                        log_data[f'val_global/val_{agg_name}_f1_micro'] = m['f1_micro']
+                        log_data[f'val_global/val_{agg_name}_acc'] = m['acc']
+                        log_data[f'val_global/val_{agg_name}_loss_macro'] = m.get('loss_macro', 0.0)
                         for lbl in label_cols:
                             log_data[f'val_{agg_name}_f1/{lbl}'] = m['per_label_f1'].get(lbl, 0.0)
                             log_data[f'val_{agg_name}_loss/{lbl}'] = m['per_label_loss'].get(lbl, 0.0)
@@ -570,6 +680,39 @@ def train_and_evaluate(train_df: pd.DataFrame,
             'val_metrics': best_val_metrics,
             'test_back_metrics': test_back_metrics,
         })
+
+        # ----- Save per-aggregator predictions and probabilities -----
+        # For each aggregator, if predictions and probabilities are available,
+        # write them to CSV files for further analysis.  We save one file per
+        # aggregator and dataset (val, test_back) per fold.  Each row contains
+        # the filename, the predicted class per label, and the probability of
+        # each class per label.
+        def _save_preds(metrics: Dict[str, Dict], dataset_name: str) -> None:
+            for agg_name, m in metrics.items():
+                # y_prob and y_pred are only present when y_true is available (val/test_back)
+                if 'y_prob' in m and 'y_pred' in m and 'names' in m:
+                    y_pred_arr = m['y_pred']  # shape (N, L)
+                    y_prob_arr = m['y_prob']  # shape (N, L, C)
+                    names_list = m['names']
+                    # Construct DataFrame
+                    df_pred = pd.DataFrame({'filename': names_list})
+                    for i, lbl in enumerate(label_cols):
+                        df_pred[lbl] = y_pred_arr[:, i]
+                        for cls_idx in range(y_prob_arr.shape[-1]):
+                            df_pred[f'{lbl}_{cls_idx}'] = y_prob_arr[:, i, cls_idx]
+                    # Ensure directory exists
+                    agg_dir = os.path.join(out_dir, f'preds_fold{fold}')
+                    os.makedirs(agg_dir, exist_ok=True)
+                    # File path
+                    file_name = f'{dataset_name}_{agg_name}_fold{fold}_preds.csv'
+                    file_path = os.path.join(agg_dir, file_name)
+                    df_pred.to_csv(file_path, index=False)
+                    print(f"Saved {dataset_name} predictions for aggregator '{agg_name}' to {file_path}")
+        # Save validation predictions
+        _save_preds(best_val_metrics, 'val')
+        # Save test_back predictions
+        if test_back_metrics:
+            _save_preds(test_back_metrics, 'test_back')
         if use_wandb and run is not None:
             # Prepare summary metrics for this fold (best F1 and optional test_back)
             summary_data: Dict[str, float | int] = {
@@ -721,10 +864,6 @@ def train_and_evaluate(train_df: pd.DataFrame,
             en_run.log(log_data, step=0)
             en_run.finish()
     # Return results
-    return {
-        'fold_results': fold_results,
-        'ensemble_results': ensemble_results,
-    }
     return {
         'fold_results': fold_results,
         'ensemble_results': ensemble_results,

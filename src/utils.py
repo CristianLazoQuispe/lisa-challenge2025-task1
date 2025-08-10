@@ -106,13 +106,13 @@ def compute_weights_from_df(
     """
     if method == "manual":
         weights_per_label = {
-            "Noise":      torch.tensor([1.0, 10.0, 20.0]),
-            "Zipper":     torch.tensor([1.0, 10.0, 20.0]),
-            "Positioning":torch.tensor([1.0, 10.0, 20.0]),
-            "Banding":    torch.tensor([1.0, 10.0, 20.0]),
-            "Motion":     torch.tensor([1.0, 10.0, 20.0]),
-            "Contrast":   torch.tensor([1.0, 10.0, 20.0]),
-            "Distortion": torch.tensor([1.0, 10.0, 20.0]),
+            "Noise":      torch.tensor([1.0, 2.0, 5.0]),
+            "Zipper":     torch.tensor([1.0, 2.0, 5.0]),
+            "Positioning":torch.tensor([1.0, 2.0, 5.0]),
+            "Banding":    torch.tensor([1.0, 2.0, 5.0]),
+            "Motion":     torch.tensor([1.0, 2.0, 5.0]),
+            "Contrast":   torch.tensor([1.0, 2.0, 5.0]),
+            "Distortion": torch.tensor([1.0, 2.0, 5.0]),
         }
         return weights_per_label
     

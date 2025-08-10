@@ -81,7 +81,8 @@ class MRIDataset2D(Dataset):
                  use_augmentation: bool = False,
                  is_numpy: bool = True,
                  labels: Iterable[str] = (),
-                 image_size: int = 224) -> None:
+                 image_size: int = 224,
+                 use_norma : bool = True) -> None:
         import pandas as pd  # imported here to avoid top‑level dependency if not needed
         self.df = df.reset_index(drop=True)
         self.is_train = is_train
@@ -89,6 +90,7 @@ class MRIDataset2D(Dataset):
         self.is_numpy = is_numpy
         self.labels = list(labels)
         self.image_size = image_size
+        self.use_norma = use_norma
         # Map view codes to one‑hot vectors (axial, coronal, sagittal)
         self.view2onehot = {
             "axi": torch.tensor([1, 0, 0], dtype=torch.float32),
@@ -126,8 +128,9 @@ class MRIDataset2D(Dataset):
             A.Affine(scale=(0.9, 1.1), translate_percent=(0.0, 0.1), p=0.5),
             # One of mild noise or blur
             A.OneOf([
-                A.GaussNoise(var_limit=(1e-5, 0.005), p=1.0),
-                A.GaussianBlur(blur_limit=(3, 7), sigma_limit=(0.1, 1.0), p=1.0),
+                A.GaussNoise(std_range=(1e-5, 2e-1), mean_range=(0,1e-4), p=1.0),   # ruido muy leve
+                A.GaussianBlur(sigma_limit= (0.5,5), blur_limit=(3,20), p=1.0),                # desenfoque apenas perceptible
+                A.MedianBlur(blur_limit=(3,21), p=1.0),
             ], p=0.3),
         ]
         return A.Compose([A.Resize(image_size, image_size)] + aug_transforms + [ToTensorV2()])
@@ -161,13 +164,14 @@ class MRIDataset2D(Dataset):
             # Open image file in grayscale
             img = Image.open(row['img_path']).convert('L')
             img = np.array(img, dtype=np.float32)
-        # Normalise slice: Z‑score
-        mean_val = float(img.mean())
-        std_val = float(img.std())
-        if std_val > 1e-6:
-            img = (img - mean_val) / std_val
-        else:
-            img = np.zeros_like(img, dtype=np.float32)
+        if self.use_norma:
+            # Normalise slice: Z‑score
+            mean_val = float(img.mean())
+            std_val = float(img.std())
+            if std_val > 1e-6:
+                img = (img - mean_val) / std_val
+            else:
+                img = np.zeros_like(img, dtype=np.float32)
         # Expand to (H, W, 1) for Albumentations
         img = np.expand_dims(img, axis=-1)
         # Apply transforms to convert to tensor

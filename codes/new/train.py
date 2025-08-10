@@ -47,27 +47,23 @@ from typing import List, Optional
 
 import pandas as pd
 from dotenv import load_dotenv
-import sys
-import gc
-import os
-
-sys.path.append("../../")
 
 from utils import set_seed, LABELS
 from trainer import train_and_evaluate
-
+from filtering import filter_dataset_by_similarity_ssim
+from sklearn.model_selection import train_test_split
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train and evaluate LISA models with cross validation.")
+    parser.add_argument('--top_k', type=int, default=2, help='Número de etiquetas raras para la estratificación')
     parser.add_argument("--train_csv", type=str, default="../../results/preprocessed_data/df_train_imgs.csv")
     parser.add_argument("--test_csv", type=str, default="../../results/preprocessed_data/df_test_imgs.csv")
-
-    #parser.add_argument('--train_csv', type=str, required=True, help='Path to training CSV')
-    #parser.add_argument('--test_csv', type=str, default=None, help='Path to test CSV (no labels) for final inference')
     parser.add_argument('--test_back_csv', type=str, default=None, help='Path to test_back CSV with labels')
     parser.add_argument('--save_dir', type=str, default='./models', help='Directory to save models and outputs')
     parser.add_argument('--experiment_name', type=str, default='lisa_experiment', help='Name of the experiment for WandB')
     parser.add_argument('--n_splits', type=int, default=5, help='Number of cross‑validation splits')
+    parser.add_argument('--threshold_brain_presence', type=float, default=0.3, help='threshold for filtering slices')
+    parser.add_argument('--dynamic_w', type=str, default="0.25, 0.75, 1.0", help='threshold for filtering slices') 
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=30, help='Maximum number of epochs per fold')
     parser.add_argument('--patience', type=int, default=5, help='Number of epochs without improvement before stopping')
@@ -93,6 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--scheduler_patience', type=int, default=5, help='Patience for LR scheduler')
     parser.add_argument('--log_interval', type=int, default=50, help='Steps between logging to WandB')
     parser.add_argument('--do_inference', action='store_true', help='Perform inference on test set after training')
+    parser.add_argument('--split_by_volume', action='store_true', help='Use volume-level stratified folds instead of patient-level')
+    parser.add_argument('--volume_id', type=str, default='patient_id', help='Column name to identify volumes when splitting by volume')
     return parser.parse_args()
 
 
@@ -144,11 +142,27 @@ def main() -> None:
     # Load train data
     train_df = pd.read_csv(args.train_csv)
     train_df = preprocess_df(train_df, LABELS)
+
+    #train_df = train_df[train_df["ratio"]>=args.threshold_brain_presence].reset_index()
+    
+    print(f"Original: {train_df.shape}")
+    #train_df = filter_dataset_by_similarity_ssim(train_df, ssim_thresh=0.6)
+    print(f"→ Filtrado: {train_df.shape}")
+
     # Load test_back if provided
     test_back_df = None
     if args.test_back_csv:
         test_back_df = pd.read_csv(args.test_back_csv)
         test_back_df = preprocess_df(test_back_df, LABELS)
+    else:
+        print("Doing TEST BACK")
+        df_all = train_df.copy()
+        df_all["patient_id"] = df_all["filename"].str.extract(r"(LISA_\d+)")
+        train_ids, test_ids = train_test_split(df_all["patient_id"].unique(), test_size=0.1, random_state=42, shuffle=True)
+        train_df     = df_all[df_all["patient_id"].isin(train_ids)].reset_index(drop=True)
+        test_back_df = df_all[df_all["patient_id"].isin(test_ids)].reset_index(drop=True)
+        test_back_df = preprocess_df(test_back_df, LABELS)
+
     # Call training
     if not(args.do_inference and args.test_csv):
         results = train_and_evaluate(
@@ -160,6 +174,17 @@ def main() -> None:
         )
     # Optionally run inference on final test set
     if args.do_inference and args.test_csv:
+        """Realiza inferencia en el conjunto de test sin etiquetas y guarda
+        resultados por agregador.  Por cada agregador indicado en
+        ``args.aggregators``, promedia las probabilidades de todos los
+        modelos de los folds y calcula la clase final por etiqueta.  Se
+        escriben CSVs separados para cada agregador con el sufijo
+        ``submission_<aggregator>.csv`` en el directorio de ``save_dir``.
+
+        El CSV contiene la columna ``filename`` (identificador del
+        volumen), la predicción de cada etiqueta y la probabilidad de
+        cada clase (``<label>_0``, ``<label>_1``, ``<label>_2``).
+        """
         # Import inference utilities lazily to avoid circular import
         from dataset import MRIDataset2D
         from model import Model2DTimm
@@ -168,14 +193,20 @@ def main() -> None:
         import torch
         # Load test dataframe
         test_df = pd.read_csv(args.test_csv)
+        print(f"df_test Original: {test_df.shape}")
+        #test_df  = test_df[test_df["ratio"]>=args.threshold_brain_presence].reset_index()
+        print(f"df_test Original: {test_df.shape}")
+        #test_df = filter_dataset_by_similarity_ssim(test_df, ssim_thresh=0.6)
+        print(f"df_test→ Filtrado: {test_df.shape}")
         # We expect no labels; still need patient_id
         test_df['patient_id'] = test_df['filename'].apply(extract_patient_id)
         test_ds = MRIDataset2D(test_df, is_train=False, use_augmentation=False,
                                is_numpy=True, labels=LABELS, image_size=args.image_size)
         test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                                  num_workers=args.num_workers, pin_memory=True)
-        # Load models from folds
+        # Determine device
         device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Load models from each fold
         models = []
         for fold in range(args.n_splits):
             model_path = os.path.join(args.save_dir, f"model_fold{fold}.pt")
@@ -193,46 +224,85 @@ def main() -> None:
             model.load_state_dict(state_dict)
             model.eval()
             models.append(model)
-        # Collect predictions from each model
+        # Import aggregator utilities
         from trainer import collect_slice_predictions, aggregate_slices
-        all_probs_per_model = []
+        # Collect slice-level predictions once per model
+        slice_results_per_model = []
         vol_names = None
         for model in models:
             slice_results = collect_slice_predictions(test_loader, model, device)
-            # Use mean aggregator to get per volume probabilities (no true labels)
-            y_pred, y_prob, _, names = aggregate_slices(slice_results, num_labels=len(LABELS), num_classes=3, aggregator='mean')
-            all_probs_per_model.append(y_prob)  # shape (N,L,C)
-            vol_names = names
-        # Average probabilities across models
-        mean_probs = np.mean(np.stack(all_probs_per_model, axis=0), axis=0)
-        y_pred_final = np.argmax(mean_probs, axis=-1)  # (N,L)
-        # Prepare submission DataFrame
-        submission = pd.DataFrame({'filename': vol_names})
-        for i, lbl in enumerate(LABELS):
-            submission[lbl] = y_pred_final[:, i]
-            # Optionally also output probabilities per class
-            for cls in range(3):
-                submission[f'{lbl}_{cls}'] = mean_probs[:, i, cls]
-        # Save submission
-        sub_path = os.path.join(args.save_dir, 'submission.csv')
-        submission.to_csv(sub_path, index=False)
-        print(f"Submission saved to {sub_path}")
+            slice_results_per_model.append(slice_results)
+            # derive names once using aggregator mean for names
+            if vol_names is None:
+                # Use mean aggregator to get volume names
+                _, _, _, names = aggregate_slices(slice_results, num_labels=len(LABELS), num_classes=3, aggregator='mean')
+                vol_names = names
+        # For each aggregator, compute aggregated probabilities for each model, then average
+        for agg in args.aggregators:
+            all_probs_per_model = []
+            for slice_results in slice_results_per_model:
+                # aggregator for each model
+                y_pred, y_prob, _, _ = aggregate_slices(slice_results, num_labels=len(LABELS), num_classes=3, aggregator=agg)
+                all_probs_per_model.append(y_prob)
+            # Average probabilities across models
+            mean_probs = np.mean(np.stack(all_probs_per_model, axis=0), axis=0)  # (N,L,C)
+            y_pred_final = np.argmax(mean_probs, axis=-1)  # (N,L)
+            # Construct submission DataFrame
+            submission = pd.DataFrame({'filename': vol_names})
+            for i, lbl in enumerate(LABELS):
+                submission[lbl] = y_pred_final[:, i]
+                for cls in range(mean_probs.shape[-1]):
+                    submission[f'{lbl}_{cls}'] = mean_probs[:, i, cls]
+            # File name includes aggregator
+            suffix = agg
+            sub_path = os.path.join(args.save_dir, f'submission_{suffix}_probs.csv')
+            submission.to_csv(sub_path, index=False)
+            print(f"Saved submission for aggregator '{agg}' to {sub_path}")
+            sub_path = os.path.join(args.save_dir, f'submission_{suffix}_preds.csv')
+            submission[["filename"]+LABELS].to_csv(sub_path, index=False)
+            print(f"Saved submission for aggregator '{agg}' to {sub_path}")
 
 
 if __name__ == '__main__':
     main()
+
     """
+    
     python train.py \
-    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/lisa_clean \
-    --n_splits 2 \
-    --device cuda:4 \
-    --epochs 1 \
+    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/lisa_clean_simple \
+    --experiment_name lisa_clean_simple \
+    --device cuda:5 \
+    --epochs 500 \
+    --patience 20 \
     --image_size 256 \
-    --batch_size 16 \
-    --lr 1e-4 \
+    --batch_size 32 \
+    --lr 1e-5 \
+    --base_model maxvit_nano_rw_256.sw_in1k \
+    --head_type simple \
+    --use_view \
+    --aggregators mean vote max weighted \
+    --volume_id patient_id \
+    --n_splits 5 \
+    --top_k 0
+
+
+    python train.py \
+    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/lisa_clean_label_tokens_testback5 \
+    --experiment_name lisa_clean_label_tokens_testback5 \
+    --device cuda:0 \
+    --slice_frac  0.99 \
+    --dynamic_w 0.1,0.25,0.75 \
+    --epochs 5000 \
+    --patience 100 \
+    --image_size 256 \
+    --batch_size 32 \
+    --lr 1e-5 \
     --base_model maxvit_nano_rw_256.sw_in1k \
     --head_type label_tokens \
     --use_view \
-    --aggregators mean vote max weighted
-
+    --aggregators mean vote max weighted \
+    --volume_id patient_id \
+    --n_splits 5 \
+    --top_k 2
+    
     """

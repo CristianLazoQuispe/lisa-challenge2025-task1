@@ -109,6 +109,7 @@ class MRIDataset2D(Dataset):
             img = np.expand_dims(arr, axis=-1)  # (H, W) → (H, W, 1)
             #img = (img-img.min())/(img.max()-img.min())
 
+            """
             min_val = img.min()
             max_val = img.max()
 
@@ -116,13 +117,29 @@ class MRIDataset2D(Dataset):
                 img = (img - min_val) / (max_val - min_val)
             else:
                 img = np.zeros_like(img)  # o img.fill(0.0)
+            """
+            # Normalise slice: Z‑score
+            mean_val = float(img.mean())
+            std_val = float(img.std())
+            #print(std_val)
+            if std_val > 1e-6:
+                img = (img - mean_val) / std_val
+            else:
+                img = np.zeros_like(img, dtype=np.float32)
 
             img = img.astype(np.float32)        # obligatorio para Albumentations
 
         else:
             img = Image.open(row['img_path']).convert("L")  # "L" es modo de 8 bits en escala de grises
             img = np.array(img, dtype=np.float32)  # ahora img tiene shape (H, W)
-            img = (img-img.min())/(img.max()-img.min())
+            mean_val = float(img.mean())
+            std_val = float(img.std())
+            if std_val > 1e-6:
+                img = (img - mean_val) / std_val
+            else:
+                img = np.zeros_like(img, dtype=np.float32)
+            #img = (img-img.min())/(img.max()-img.min())
+            
             img = np.expand_dims(img, axis=-1)     # (H, W, 1) para Albumentations
             
         if self.transform:

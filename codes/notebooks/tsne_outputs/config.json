@@ -1,0 +1,12 @@
+{
+  "backbone": "biomedclip_hf",
+  "feat_dim": 512,
+  "img_size": 224,
+  "prefer_source": "npy",
+  "categories": [
+    "Positioning",
+    "Contrast",
+    "Banding"
+  ],
+  "seed": 1337
+}

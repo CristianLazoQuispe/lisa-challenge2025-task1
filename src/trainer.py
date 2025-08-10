@@ -24,12 +24,33 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 def epoch_subsample(df, frac=0.5, seed=None):
     # Submuestrea dentro de cada paciente sin el warning
+    rng = np.random.default_rng(seed)
+
+    # Lista de patient_id únicos y muestreo del frac
+    unique_patients = df["patient_id"].unique()
+    n_select = max(1, int(len(unique_patients) * frac))
+    selected_patients = rng.choice(unique_patients, size=n_select, replace=False)
+
+    # Filtrar DataFrame
+    df_selected = df[df["patient_id"].isin(selected_patients)]
+
+    # Elegir un registro aleatorio por paciente
+    df_sampled = (
+        df_selected.groupby("patient_id", group_keys=False)
+                   .sample(n=5, random_state=seed, replace=True)
+                  .reset_index(drop=True)
+                   #.apply(lambda g: g.sample(n=5, random_state=seed, replace=True))
+                   #.reset_index(drop=True)
+    )
+    return df_sampled
+    """
     return (
         df.groupby("patient_id", group_keys=False)
           .sample(frac=frac, random_state=seed)
           .reset_index(drop=True)
     )
-
+    """
+    
 def apply_label_smoothing(y, smoothing=0.05, num_classes=3):
     """Convierte etiquetas one-hot a suavizadas."""
     with torch.no_grad():
@@ -89,7 +110,8 @@ def inference_dataset(val_loader,model,args):
         for x, y, path, view in val_loader:
             x = x.to(args.device)
             view = view.to(args.device)
-            y_hat = model(x)
+            with torch.cuda.amp.autocast():
+                y_hat = model(x)
             pred = torch.argmax(y_hat, dim=-1).cpu()
             # 🧠 Guarda softmax por clase
             batch_probs = torch.stack([torch.softmax(y_hat[:, i], dim=-1) for i in range(len(args.label_cols))], dim=1)
@@ -106,6 +128,9 @@ from sklearn.metrics import f1_score, accuracy_score, precision_recall_fscore_su
 
 def get_metrics(df_train, val_oof_records, args, prefix=""):
     val_df_oof = pd.DataFrame(val_oof_records)
+    print("GET metrics")
+    print(df_train.shape)
+    print(val_df_oof.shape)
     val_df_oof = df_train[["filename", *args.label_cols]].merge(val_df_oof, on="filename", suffixes=("_true", "_pred"))
 
     y_true = val_df_oof[[f"{l}_true" for l in args.label_cols]].values
@@ -208,7 +233,6 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
     criterions = get_per_label_criterions(label_cols, weights_per_label, args)
 
     val_oof_records  = []
-    test_oof_records = []
     test_preds_accum = []
     fold_scores = []
     log_values = {}
@@ -329,7 +353,7 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
                     grad_scaler.scale(loss).backward()
                     update_optimizer(model,optimizer, grad_scaler, 0.5,None)
                     #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                    optimizer.step()
+                    #optimizer.step()
                     total_loss += loss.item()
 
             # Validation
@@ -341,31 +365,32 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
                 for x, y, path, view in tqdm(val_loader, desc=f"Val Fold {fold} Epoch {epoch}"):
                     x, y = x.to(args.device), y.to(args.device)
                     view = view.to(args.device)
-                    y_hat = model(x)
-                    loss = sum(criterions[i](y_hat[:, i], y[:, i]) for i in range(len(label_cols))) / len(label_cols)
-                    pred = torch.argmax(y_hat, dim=-1).cpu()
-                    # 🧠 Guarda softmax por clase
-                    batch_probs = torch.stack([torch.softmax(y_hat[:, i], dim=-1) for i in range(len(label_cols))], dim=1)
-                    # shape (B, 7, 3)
-                    val_probs.append(batch_probs.cpu())
-                    val_trues.append(y.cpu())
-                    val_paths.extend(path)
-                    val_preds.append(pred)
-                    val_total_loss+=loss.item()
+                    with torch.cuda.amp.autocast():
+                        y_hat = model(x)
+                        loss = sum(criterions[i](y_hat[:, i], y[:, i]) for i in range(len(label_cols))) / len(label_cols)
+                        pred = torch.argmax(y_hat, dim=-1).cpu()
+                        # 🧠 Guarda softmax por clase
+                        batch_probs = torch.stack([torch.softmax(y_hat[:, i], dim=-1) for i in range(len(label_cols))], dim=1)
+                        # shape (B, 7, 3)
+                        val_probs.append(batch_probs.cpu())
+                        val_trues.append(y.cpu())
+                        val_paths.extend(path)
+                        val_preds.append(pred)
+                        val_total_loss+=loss.item()
 
-                    # 🎯 Diagnóstico de pérdida por etiqueta
-                    losses_by_label = [
-                        criterions[i](y_hat[:, i], y[:, i]).item()
-                        for i in range(len(label_cols))
-                    ]
+                        # 🎯 Diagnóstico de pérdida por etiqueta
+                        losses_by_label = [
+                            criterions[i](y_hat[:, i], y[:, i]).item()
+                            for i in range(len(label_cols))
+                        ]
 
-                    for i, label in enumerate(label_cols):
-                        loss_log_values[f"val_{label}_loss"] += losses_by_label[i]
+                        for i, label in enumerate(label_cols):
+                            loss_log_values[f"val_{label}_loss"] += losses_by_label[i]
 
-                    for i, label in enumerate(label_cols):
-                        probs = torch.softmax(y_hat[:, i], dim=-1).detach().cpu().numpy()
-                        entropies = scipy.stats.entropy(probs.T)  # (B,)
-                        #print(f"{label} entropy mean: {np.mean(entropies):.4f} ± {np.std(entropies):.4f}")
+                        for i, label in enumerate(label_cols):
+                            probs = torch.softmax(y_hat[:, i], dim=-1).detach().cpu().numpy()
+                            entropies = scipy.stats.entropy(probs.T)  # (B,)
+                            #print(f"{label} entropy mean: {np.mean(entropies):.4f} ± {np.std(entropies):.4f}")
 
 
             #y_pred_val = torch.cat(val_preds).cpu().numpy()
@@ -439,6 +464,7 @@ def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
         for yp, yt, f in zip(y_pred_val, y_true_val, val_files):
             val_oof_records.append({**{l: yp[i] for i, l in enumerate(args.label_cols)}, "filename": f})
 
+        test_oof_records = []
         y_pred_test,y_prod_val,y_true_test,test_files = inference_dataset(test_loader,model,args)
         for yp, yt, f in zip(y_pred_test, y_true_test, test_files):
             test_oof_records.append({**{l: yp[i] for i, l in enumerate(args.label_cols)}, "filename": f})
