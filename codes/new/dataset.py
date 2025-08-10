@@ -31,7 +31,22 @@ from torch.utils.data import Dataset
 import torch
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from . import new_augmentations
+import sys
+import gc
+import os
+
+import sys
+import gc
+import os
+
+# Ruta absoluta del script actual
+current_path = os.path.dirname(os.path.abspath(__file__))
+
+# Agregar al sys.path si no está
+if current_path not in sys.path:
+    sys.path.append(current_path)
+
+import new_augmentations
 
 class MRIDataset2D(Dataset):
     """Dataset that loads individual 2D slices extracted from 3D NIfTI volumes.
@@ -134,10 +149,10 @@ class MRIDataset2D(Dataset):
         if not use_augmentation:
             return A.Compose(base_transforms)
         aug_transforms = [
-            new_augmentations.CenterDeBorder(p=0.5),
+            new_augmentations.CenterDeBorder(max_crop=0.1, p=0.3), #, min_keep=8
             # Slight random rotation around the slice plane
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
+            A.HorizontalFlip(p=0.2),
+            A.VerticalFlip(p=0.2),
             A.Rotate(limit=15, p=0.5),
 
             # Minor affine transformations (scale and translation)
@@ -148,7 +163,7 @@ class MRIDataset2D(Dataset):
                 # 🔳 Apagar zonas aleatorias (simula distorsión visual o falta de señal)
                 A.CoarseDropout(num_holes_range=(1,2), hole_height_range=(0.1, 0.2), hole_width_range=(0.1, 0.2), fill=0, p=1.0),
                 # 🖼️ Zoom tipo crop + resize (cambia FOV)
-                A.RandomResizedCrop(size=(512, 512), scale=(0.8, 1.0), ratio=(0.8, 1.2), p=1),
+                A.RandomResizedCrop(size=(image_size, image_size), scale=(0.8, 1.0), ratio=(0.8, 1.2), p=1),
             ], p=0.3),                        
             # One of mild noise or blur
             A.OneOf([
@@ -161,10 +176,10 @@ class MRIDataset2D(Dataset):
                 A.MultiplicativeNoise(multiplier=(0.95, 1.2), p=1.0),   # cambia el contraste levemente
                 A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1,p=1.0),
                 A.CLAHE(clip_limit=2,p=1.0),
+                new_augmentations.RandomZipperStripe(p=1.0, max_amp=0.18, min_period=6, max_period=22, axis="rand"),
+                new_augmentations.RandomBandCut(p=1.0),
             ], p=0.3),
 
-            new_augmentations.RandomZipperStripe(p=0.20, max_amp=0.18, min_period=6, max_period=22, axis="rand"),
-            new_augmentations.RandomBandCut(p=0.12),
         ]
         return A.Compose([A.Resize(image_size, image_size)] + aug_transforms + [ToTensorV2()])
 

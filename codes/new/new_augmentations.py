@@ -11,58 +11,69 @@ from torch.utils.data import Dataset
 import torch
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-
+import cv2
 # ---------- Augmentations específicas para zipper ----------
+# --- AUGS SEGURAS EN HxWx1 (float32) ---
+import numpy as np
+import albumentations as A
 
 class RandomZipperStripe(A.ImageOnlyTransform):
     """
-    Inyecta un patrón sinusoidal tipo 'zipper' débil en X o Y.
-    Trabaja en HxWxC (float32). No cambia la media global fuerte.
+    Zipper sintético eficiente en memoria.
+    - No repite arrays (usa broadcasting).
+    - Sin normalización por mean/std (escala fija basada en var(sin)=1/2).
+    - Devuelve HxWx1 float32 contiguo.
     """
     def __init__(self, p=0.15, max_amp=0.20, min_period=6, max_period=22, axis="rand"):
-        super().__init__(always_apply=False, p=p)
-        self.max_amp = max_amp
-        self.min_period = min_period
-        self.max_period = max_period
-        self.axis = axis  # "x", "y" o "rand"
+        super().__init__( p=p)
+        self.max_amp = float(max_amp)
+        self.min_period = int(min_period)
+        self.max_period = int(max_period)
+        self.axis = axis  # "x", "y", "rand"
+
+    def get_transform_init_args_names(self):
+        return ("max_amp", "min_period", "max_period", "axis")
 
     def apply(self, img, **params):
-        x = img.astype(np.float32)
-        h, w, c = x.shape
-        amp = np.random.uniform(0.06, self.max_amp)
-        period = np.random.randint(self.min_period, self.max_period + 1)
-        phase = np.random.uniform(0, 2 * np.pi)
+        # img: HxWxC (C=1) o HxW
+        x = img.astype(np.float32, copy=False)
+        if x.ndim == 2:
+            x = x[:, :, None]
+        H, W, C = x.shape
 
-        axis = self.axis
-        if axis == "rand":
-            axis = "x" if np.random.rand() < 0.5 else "y"
+        amp    = np.random.uniform(0.06, self.max_amp)
+        period = np.random.randint(self.min_period, self.max_period + 1)
+        phase  = np.random.uniform(0, 2*np.pi)
+
+        # Elegir eje
+        axis = self.axis if self.axis != "rand" else ("x" if np.random.rand() < 0.5 else "y")
+
+        # Escala para que el seno tenga std ~ 0.5 sin calcular mean/std por imagen:
+        # std(sin)=1/sqrt(2) ~ 0.707 -> multiplicamos por (0.5 / 0.707) ~ 0.707
+        scale = 0.5 / np.sqrt(2.0)
 
         if axis == "x":
-            grid = np.sin(2 * np.pi * (np.arange(w)[None, :] / period) + phase)
-            stripe = np.repeat(grid[None, :, :], h, axis=0)  # HxW
-        else:  # "y"
-            grid = np.sin(2 * np.pi * (np.arange(h)[:, None] / period) + phase)
-            stripe = np.repeat(grid[:, :, None], w, axis=1).squeeze(-1)
+            # forma (1, W, 1) -> se difunde a (H, W, 1)
+            u = (np.arange(W, dtype=np.float32) * (2*np.pi / period)) + phase
+            stripe = np.sin(u, dtype=np.float32)[None, :, None] * scale
+        else:
+            # forma (H, 1, 1) -> se difunde a (H, W, 1)
+            v = (np.arange(H, dtype=np.float32) * (2*np.pi / period)) + phase
+            stripe = np.sin(v, dtype=np.float32)[:, None, None] * scale
 
-        stripe = stripe[:, :, None]  # HxWx1
-        # normaliza a +/-0.5 para no saturar
-        stripe = stripe - stripe.mean()
-        stripe = stripe / (np.std(stripe) + 1e-6) * 0.5
-        x = x + amp * stripe
-        return x
+        # out = x + amp * stripe  (stripe se broadcast sin crear HxW explícito)
+        out = x + amp * stripe
+        # Asegura contigüidad/writable para siguientes pasos (ToTensorV2/own tensor):
+        return np.ascontiguousarray(out, dtype=np.float32)
 
 class RandomBandCut(A.ImageOnlyTransform):
-    """
-    Enmascara una banda horizontal o vertical muy delgada (occlusion bands)
-    para robustez a la localización exacta del zipper.
-    """
-    def __init__(self, p=0.1, max_thick_ratio=0.06):
-        super().__init__(always_apply=False, p=p)
+    def __init__(self, p=0.10, max_thick_ratio=0.06):
+        super().__init__( p=p)
         self.max_thick_ratio = max_thick_ratio
 
     def apply(self, img, **params):
-        x = img.astype(np.float32)
-        h, w, c = x.shape
+        x = img.astype(np.float32)           # HxWx1
+        h, w, _ = x.shape
         is_h = np.random.rand() < 0.5
         thick = int(max(1, (h if is_h else w) * np.random.uniform(0.01, self.max_thick_ratio)))
         if is_h:
@@ -73,25 +84,25 @@ class RandomBandCut(A.ImageOnlyTransform):
             x[:, x0:x0+thick, :] = 0.0
         return x
 
+
 class CenterDeBorder(A.ImageOnlyTransform):
-    """
-    Recorta sutilmente los bordes (0–4%) y rescalea, para reducir sesgos de coil/bordes.
-    """
     def __init__(self, max_crop=0.04, p=0.5):
-        super().__init__(always_apply=False, p=p)
+        super().__init__( p=p)
         self.max_crop = max_crop
 
     def apply(self, img, **params):
+        # img: HxWx1 float32
         x = img.astype(np.float32)
-        h, w, c = x.shape
+        h, w, _ = x.shape
         cy = int(h * self.max_crop * np.random.rand())
         cx = int(w * self.max_crop * np.random.rand())
         y0, y1 = cy, h - cy
         x0, x1 = cx, w - cx
-        if y1 - y0 < 8 or x1 - x0 < 8:
+        if (y1 - y0) < 8 or (x1 - x0) < 8:
             return x
-        crop = x[y0:y1, x0:x1, :]
-        # resize back
-        return np.array(Image.fromarray((crop.squeeze(-1)).astype(np.float32)).resize((w, h), Image.BILINEAR))[:, :, None]
-
-# ----------------------------------------------------------
+        crop = x[y0:y1, x0:x1, :]                 # sigue Hc×Wc×1
+        # resize con cv2 manteniendo canal
+        crop2 = cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+        if crop2.ndim == 2:                        # a veces cv2 devuelve HW
+            crop2 = crop2[:, :, None]
+        return crop2.astype(np.float32)

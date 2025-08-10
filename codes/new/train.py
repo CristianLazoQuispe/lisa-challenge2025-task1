@@ -52,6 +52,14 @@ from utils import set_seed, LABELS
 from trainer import train_and_evaluate
 from filtering import filter_dataset_by_similarity_ssim
 from sklearn.model_selection import train_test_split
+import os
+import wandb
+
+
+os.environ["WANDB_DIR"] = "/data/cristian/paper_2025/wandb_dir"  # Aquí se guardarán los archivos temporales y logs
+os.environ["WANDB_CACHE_DIR"] = "/data/cristian/paper_2025/wandb_dir"
+os.environ["WANDB_ARTIFACT_DIR"] = "/data/cristian/paper_2025/wandb_dir"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train and evaluate LISA models with cross validation.")
@@ -146,7 +154,8 @@ def main() -> None:
     train_df = pd.read_csv(args.train_csv)
     train_df = preprocess_df(train_df, LABELS)
 
-    #train_df = train_df[train_df["ratio"]>=args.threshold_brain_presence].reset_index()
+    print(f"Original: {train_df.shape}")
+    train_df = train_df[train_df["ratio"]>=args.threshold_brain_presence].reset_index()
     
     print(f"Original: {train_df.shape}")
     #train_df = filter_dataset_by_similarity_ssim(train_df, ssim_thresh=0.6)
@@ -197,7 +206,7 @@ def main() -> None:
         # Load test dataframe
         test_df = pd.read_csv(args.test_csv)
         print(f"df_test Original: {test_df.shape}")
-        #test_df  = test_df[test_df["ratio"]>=args.threshold_brain_presence].reset_index()
+        test_df  = test_df[test_df["ratio"]>=args.threshold_brain_presence].reset_index()
         print(f"df_test Original: {test_df.shape}")
         #test_df = filter_dataset_by_similarity_ssim(test_df, ssim_thresh=0.6)
         print(f"df_test→ Filtrado: {test_df.shape}")
@@ -326,4 +335,7 @@ if __name__ == '__main__':
     --n_splits 5 \
     --top_k 2 \
     --do_inference
+    
+    
+    python train.py     --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/lisa_clean_label_tokens_testback2_z_newaug     --experiment_name lisa_clean_label_tokens_testback2_z_newaug     --norm_mode dataset_z_per_view     --device cuda:1     --slice_frac  0.99     --dynamic_w 0.25,0.5,1.0     --epochs 5000     --patience 100     --image_size 256     --batch_size 32     --lr 1e-5     --base_model maxvit_nano_rw_256.sw_in1k     --head_type label_tokens     --use_view     --aggregators mean vote max weighted     --volume_id patient_id     --n_splits 5     --top_k 2 --threshold_brain_presence 0.1    --do_inference
     """
