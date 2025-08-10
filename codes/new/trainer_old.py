@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import os
 import json
-import joblib
 from typing import Iterable, List, Dict, Tuple, Optional
 
 import numpy as np
@@ -120,53 +119,6 @@ def collect_slice_predictions(loader: DataLoader, model: nn.Module, device: torc
                     'true': y_np[i] if y_np is not None else None,
                 })
     return results
-
-def compute_stats_per_view(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    """
-    Compute clipping percentiles and mean/std for each view code based on
-    the slices in ``df``.  Returns a dictionary mapping view code to
-    ``{'p1', 'p99', 'mean', 'std'}`` used for dataset_z_per_view normalisation.
-    """
-    import numpy as np
-    import os
-    stats: Dict[str, Dict[str, float]] = {}
-    buckets: Dict[str, List[np.ndarray]] = {}
-    for idx in range(len(df)):
-        row = df.iloc[idx]
-        path = row.get('npy_path')# or row.get('img_path') or row.get('path') or row.get('filename')
-        if not path:
-            continue
-        # Determine view code from file name
-        view_code = 'axi'
-        try:
-            base_name = os.path.basename(path)
-            if '_LF_' in base_name:
-                view_code = base_name.split('_LF_')[-1].split('_')[0]
-        except Exception:
-            view_code = 'axi'
-        # Load array (support .npy or .pkl)
-        load_path = path
-        if load_path.endswith('.npy'):
-            load_path = load_path.replace('.npy', '.pkl')
-        arr = joblib.load(load_path).astype(np.float32)
-        buckets.setdefault(view_code, []).append(arr.ravel())
-    for view, arrs in buckets.items():
-        if not arrs:
-            continue
-        x = np.concatenate(arrs)
-        p1 = np.percentile(x, 1)
-        p99 = np.percentile(x, 99)
-        x_clip = np.clip(x, p1, p99)
-        mu = x_clip.mean()
-        sigma = x_clip.std() + 1e-6
-        stats[view] = {
-            'p1': float(p1),
-            'p99': float(p99),
-            'mean': float(mu),
-            'std': float(sigma),
-        }
-    print("COMPUTED! dataset_z_per_view")
-    return stats
 
 
 def aggregate_slices(results: List[Dict], num_labels: int, num_classes: int,
@@ -539,23 +491,11 @@ def train_and_evaluate(train_df: pd.DataFrame,
         # Split data
         train_fold = df[df['fold'] != fold].reset_index(drop=True)
         val_fold   = df[df['fold'] == fold].reset_index(drop=True)
-        # Determine normalisation mode and compute per-view stats for this fold if needed
-        norm_mode = args.get('norm_mode', 'slice_z')
-        per_view_stats = None
-        if norm_mode == 'dataset_z_per_view':
-            print("Compute dataset_z_per_view")
-            per_view_stats = compute_stats_per_view(train_fold)
-            # Save stats to disk for inference
-            stats_file = os.path.join(out_dir, f"per_view_stats_fold{fold}.json")
-            with open(stats_file, 'w') as f:
-                json.dump(per_view_stats, f)
-        # Create datasets with explicit normalisation
+        # Create datasets
         train_ds = MRIDataset2D(train_fold, is_train=True, use_augmentation=True,
-                                is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224),
-                                norm_mode=norm_mode, per_view_stats=per_view_stats)
+                                is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224))
         val_ds   = MRIDataset2D(val_fold,   is_train=True, use_augmentation=False,
-                                is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224),
-                                norm_mode=norm_mode, per_view_stats=per_view_stats)
+                                is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224))
         # DataLoaders
         if args.get('use_sampling', True):
             sample_weights = compute_sample_weights(train_fold, label_cols)
@@ -612,8 +552,7 @@ def train_and_evaluate(train_df: pd.DataFrame,
                 train_fold_ep = epoch_subsample_frac_unique_patients(train_fold, frac=0.1, seed=None)
 
                 train_ds_ep = MRIDataset2D(train_fold_ep, is_train=True, use_augmentation=True,
-                                           is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224),
-                                           norm_mode=norm_mode, per_view_stats=per_view_stats)
+                                           is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224))
                 if args.get('use_sampling', True):
                     sample_weights = compute_sample_weights(train_fold_ep, label_cols)
                     sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
@@ -719,8 +658,7 @@ def train_and_evaluate(train_df: pd.DataFrame,
         test_back_metrics = None
         if test_back_df is not None and not test_back_df.empty:
             test_back_ds = MRIDataset2D(test_back_df, is_train=True, use_augmentation=False,
-                                       is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224),
-                                       norm_mode=norm_mode, per_view_stats=per_view_stats)
+                                       is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224))
             test_back_loader = DataLoader(test_back_ds, batch_size=args.get('batch_size', 16), shuffle=False,
                                           num_workers=args.get('num_workers', 4), pin_memory=True)
             test_back_results = collect_slice_predictions(test_back_loader, model, device)

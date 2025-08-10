@@ -91,9 +91,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--do_inference', action='store_true', help='Perform inference on test set after training')
     parser.add_argument('--split_by_volume', action='store_true', help='Use volume-level stratified folds instead of patient-level')
     parser.add_argument('--volume_id', type=str, default='patient_id', help='Column name to identify volumes when splitting by volume')
-    parser.add_argument('--norm_mode', type=str, default='slice_z', choices=['none', 'slice_z', 'dataset_z_per_view'],
-                        help="""Normalisation mode for input images. "slice_z" applies z-score per slice (legacy behaviour)',
-                              "dataset_z_per_view" applies clipping and z-score using fixed statistics per view computed on the training set, and "none" skips normalisation.""")
     return parser.parse_args()
 
 
@@ -203,16 +200,15 @@ def main() -> None:
         print(f"df_test→ Filtrado: {test_df.shape}")
         # We expect no labels; still need patient_id
         test_df['patient_id'] = test_df['filename'].apply(extract_patient_id)
+        test_ds = MRIDataset2D(test_df, is_train=False, use_augmentation=False,
+                               is_numpy=True, labels=LABELS, image_size=args.image_size)
+        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
+                                 num_workers=args.num_workers, pin_memory=True)
         # Determine device
         device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # Import aggregator utilities
-        from trainer import collect_slice_predictions, aggregate_slices
-        import json
-        # For each fold/model, collect slice-level predictions on a dataset normalised with the fold's per-view stats
-        slice_results_per_model: List[List[dict]] = []
-        vol_names: Optional[List[str]] = None
+        # Load models from each fold
+        models = []
         for fold in range(args.n_splits):
-            # Load model for this fold
             model_path = os.path.join(args.save_dir, f"model_fold{fold}.pt")
             model = Model2DTimm(
                 base_model=args.base_model,
@@ -227,38 +223,28 @@ def main() -> None:
             state_dict = torch.load(model_path, map_location='cpu')
             model.load_state_dict(state_dict)
             model.eval()
-            # Load per-view stats for this fold if using dataset_z_per_view
-            per_view_stats_fold = None
-            if args.norm_mode == 'dataset_z_per_view':
-                print("Using dataset_z_per_view")
-                stats_file = os.path.join(args.save_dir, f"per_view_stats_fold{fold}.json")
-                if os.path.exists(stats_file):
-                    with open(stats_file, 'r') as f:
-                        per_view_stats_fold = json.load(f)
-            # Create dataset for this fold with appropriate normalisation
-            test_ds_fold = MRIDataset2D(
-                test_df, is_train=False, use_augmentation=False,
-                is_numpy=True, labels=LABELS, image_size=args.image_size,
-                norm_mode=args.norm_mode, per_view_stats=per_view_stats_fold
-            )
-            test_loader_fold = DataLoader(
-                test_ds_fold, batch_size=args.batch_size, shuffle=False,
-                num_workers=args.num_workers, pin_memory=True
-            )
-            # Collect slice predictions for this fold
-            fold_results = collect_slice_predictions(test_loader_fold, model, device)
-            slice_results_per_model.append(fold_results)
-            # Determine volume names using mean aggregator once
+            models.append(model)
+        # Import aggregator utilities
+        from trainer import collect_slice_predictions, aggregate_slices
+        # Collect slice-level predictions once per model
+        slice_results_per_model = []
+        vol_names = None
+        for model in models:
+            slice_results = collect_slice_predictions(test_loader, model, device)
+            slice_results_per_model.append(slice_results)
+            # derive names once using aggregator mean for names
             if vol_names is None:
-                _, _, _, names = aggregate_slices(fold_results, num_labels=len(LABELS), num_classes=3, aggregator='mean')
+                # Use mean aggregator to get volume names
+                _, _, _, names = aggregate_slices(slice_results, num_labels=len(LABELS), num_classes=3, aggregator='mean')
                 vol_names = names
-        # For each aggregator, compute aggregated probabilities across models and average
+        # For each aggregator, compute aggregated probabilities for each model, then average
         for agg in args.aggregators:
             all_probs_per_model = []
-            for fold_results in slice_results_per_model:
-                _, y_prob, _, _ = aggregate_slices(fold_results, num_labels=len(LABELS), num_classes=3, aggregator=agg)
+            for slice_results in slice_results_per_model:
+                # aggregator for each model
+                y_pred, y_prob, _, _ = aggregate_slices(slice_results, num_labels=len(LABELS), num_classes=3, aggregator=agg)
                 all_probs_per_model.append(y_prob)
-            # Average probabilities across models (folds)
+            # Average probabilities across models
             mean_probs = np.mean(np.stack(all_probs_per_model, axis=0), axis=0)  # (N,L,C)
             y_pred_final = np.argmax(mean_probs, axis=-1)  # (N,L)
             # Construct submission DataFrame
@@ -267,7 +253,7 @@ def main() -> None:
                 submission[lbl] = y_pred_final[:, i]
                 for cls in range(mean_probs.shape[-1]):
                     submission[f'{lbl}_{cls}'] = mean_probs[:, i, cls]
-            # Write predictions and probabilities to CSV
+            # File name includes aggregator
             suffix = agg
             sub_path = os.path.join(args.save_dir, f'submission_{suffix}_probs.csv')
             submission.to_csv(sub_path, index=False)
@@ -301,12 +287,11 @@ if __name__ == '__main__':
 
 
     python train.py \
-    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/lisa_clean_label_tokens_testback2_z \
-    --experiment_name lisa_clean_label_tokens_testback2_z \
-    --norm_mode dataset_z_per_view \
+    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/lisa_clean_label_tokens_testback5 \
+    --experiment_name lisa_clean_label_tokens_testback5 \
     --device cuda:0 \
     --slice_frac  0.99 \
-    --dynamic_w 0.25,0.5,1.0 \
+    --dynamic_w 0.1,0.25,0.75 \
     --epochs 5000 \
     --patience 100 \
     --image_size 256 \

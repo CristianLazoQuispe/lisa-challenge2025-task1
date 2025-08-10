@@ -82,11 +82,7 @@ class MRIDataset2D(Dataset):
                  is_numpy: bool = True,
                  labels: Iterable[str] = (),
                  image_size: int = 224,
-                 use_norma : bool = True,
-                 norm_mode: str = "slice_z",
-                 per_view_stats: Optional[dict] = None,
-                 dataset_mean: Optional[float] = None,
-                 dataset_std: Optional[float] = None) -> None:
+                 use_norma : bool = True) -> None:
         import pandas as pd  # imported here to avoid top‑level dependency if not needed
         self.df = df.reset_index(drop=True)
         self.is_train = is_train
@@ -94,15 +90,7 @@ class MRIDataset2D(Dataset):
         self.is_numpy = is_numpy
         self.labels = list(labels)
         self.image_size = image_size
-        # Legacy flag: apply z-score per slice if norm_mode remains "slice_z".
         self.use_norma = use_norma
-        # Normalisation mode: "slice_z" (per-slice z-score), "dataset_z_per_view" (fixed stats per view) or "none".
-        self.norm_mode = norm_mode
-        # Optional stats for dataset_z_per_view mode
-        self.per_view_stats = per_view_stats or {}
-        # Optional global mean/std (unused currently, reserved for future use)
-        self.dataset_mean = dataset_mean
-        self.dataset_std = dataset_std
         # Map view codes to one‑hot vectors (axial, coronal, sagittal)
         self.view2onehot = {
             "axi": torch.tensor([1, 0, 0], dtype=torch.float32),
@@ -150,88 +138,18 @@ class MRIDataset2D(Dataset):
     def __len__(self) -> int:
         return len(self.df)
 
-    def _apply_normalization(self, img: np.ndarray, view_code: str) -> np.ndarray:
-        """
-        Apply normalisation to the slice according to the selected mode.
-        Supported modes:
-
-        - ``none``: returns the image as float32 without changes.
-        - ``slice_z``: subtract mean and divide by std of this slice.
-        - ``dataset_z_per_view``: clip to [p1, p99] and z-score using fixed mean/std
-          computed on the training set for each view code (e.g. "axi", "cor", "sag").
-
-        Parameters
-        ----------
-        img: np.ndarray
-            The 2D slice as a numpy array (float32).
-        view_code: str
-            The view code extracted from the filename.
-
-        Returns
-        -------
-        np.ndarray
-            Normalised slice as float32.
-        """
-        x = img.astype(np.float32)
-        mode = self.norm_mode or ("slice_z" if self.use_norma else "none")
-        #print("MODE : ",mode)
-        #print("self.use_norma : ",self.use_norma)
-        #print("MODE : ",mode)
-        # No normalisation
-        if mode == "none":
-            return x
-        # Per-slice z-score
-        if mode == "slice_z":
-            mu = float(x.mean())
-            sigma = float(x.std())
-            if sigma > 1e-6:
-                return (x - mu) / sigma
-            # constant slice
-            return np.zeros_like(x, dtype=np.float32)
-        # Fixed stats per view
-        if mode == "dataset_z_per_view":
-            #print("per_view_stats:",self.per_view_stats)
-            #print("view_code:",view_code)
-            stats = self.per_view_stats.get(view_code)
-            #print("stats:",stats)
-            if stats is not None:
-                p1 = stats.get("p1")
-                p99 = stats.get("p99")
-                mu = stats.get("mean")
-                sigma = stats.get("std")
-                # Clip if percentiles provided
-                #print("Using dataset_z_per_view")
-                if p1 is not None and p99 is not None:
-                    x = np.clip(x, p1, p99)
-                if sigma is not None and sigma > 0:
-                    return (x - mu) / sigma
-                return x - mu
-            # Fallback: per-slice z-score if stats missing
-            mu = float(x.mean())
-            sigma = float(x.std())
-            if sigma > 1e-6:
-                return (x - mu) / sigma
-            return np.zeros_like(x, dtype=np.float32)
-        # Unknown mode -> fallback to per-slice z-score
-        mu = float(x.mean())
-        sigma = float(x.std())
-        if sigma > 1e-6:
-            return (x - mu) / sigma
-        return np.zeros_like(x, dtype=np.float32)
-
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
         # Determine the view from the path: everything after '_LF_' until '.nii'
-        full_path = row.get('npy_path')# or row.get('filename') or row.get('img_path') or row.get('npy_path')
+        full_path = row.get('path') or row.get('filename') or row.get('img_path') or row.get('npy_path')
         if full_path is None:
             raise ValueError("Row is missing a valid path or filename column")
         # Extract view code (axi/cor/sag) from something like '..._LF_axi.nii.gz'
         try:
-            view_code = full_path.split('_LF_')[-1].split('_')[0]
+            view_code = full_path.split('_LF_')[-1].split('.')[0]
         except Exception:
             view_code = 'axi'
         view_onehot = self.view2onehot.get(view_code, torch.tensor([1, 0, 0], dtype=torch.float32))
-        #print("view_onehot:",view_onehot)
         # Load image as numpy array
         if self.is_numpy:
             arr = self.data[idx]
@@ -246,8 +164,14 @@ class MRIDataset2D(Dataset):
             # Open image file in grayscale
             img = Image.open(row['img_path']).convert('L')
             img = np.array(img, dtype=np.float32)
-        # Apply selected normalisation
-        img = self._apply_normalization(img, view_code)
+        if self.use_norma:
+            # Normalise slice: Z‑score
+            mean_val = float(img.mean())
+            std_val = float(img.std())
+            if std_val > 1e-6:
+                img = (img - mean_val) / std_val
+            else:
+                img = np.zeros_like(img, dtype=np.float32)
         # Expand to (H, W, 1) for Albumentations
         img = np.expand_dims(img, axis=-1)
         # Apply transforms to convert to tensor
