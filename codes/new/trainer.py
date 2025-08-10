@@ -766,10 +766,16 @@ def train_and_evaluate(train_df: pd.DataFrame,
                     agg_dir = os.path.join(out_dir, f'preds_fold{fold}')
                     os.makedirs(agg_dir, exist_ok=True)
                     # File path
-                    file_name = f'{dataset_name}_{agg_name}_fold{fold}_preds.csv'
+                    file_name = f'{dataset_name}_{agg_name}_fold{fold}_probs.csv'
                     file_path = os.path.join(agg_dir, file_name)
                     df_pred.to_csv(file_path, index=False)
                     print(f"Saved {dataset_name} predictions for aggregator '{agg_name}' to {file_path}")
+
+                    file_name = f'{dataset_name}_{agg_name}_fold{fold}_preds.csv'
+                    file_path = os.path.join(agg_dir, file_name)
+                    df_pred[["filename"]+label_cols].to_csv(file_path, index=False)
+                    print(f"Saved {dataset_name} predictions for aggregator '{agg_name}' to {file_path}")
+
         # Save validation predictions
         _save_preds(best_val_metrics, 'val')
         # Save test_back predictions
@@ -783,10 +789,10 @@ def train_and_evaluate(train_df: pd.DataFrame,
             if test_back_metrics:
                 for agg_name, m in test_back_metrics.items():
                     if 'f1_macro' in m:
-                        summary_data[f'test_back_{agg_name}_f1_macro'] = m['f1_macro']
-                        summary_data[f'test_back_{agg_name}_f1_micro'] = m['f1_micro']
-                        summary_data[f'test_back_{agg_name}_acc'] = m['acc']
-                        summary_data[f'test_back_{agg_name}_loss_macro'] = m.get('loss_macro', 0.0)
+                        summary_data[f'test_back_global/test_back_{agg_name}_f1_macro'] = m['f1_macro']
+                        summary_data[f'test_back_global/test_back_{agg_name}_f1_micro'] = m['f1_micro']
+                        summary_data[f'test_back_global/test_back_{agg_name}_acc'] = m['acc']
+                        summary_data[f'test_back_global/test_back_{agg_name}_loss_macro'] = m.get('loss_macro', 0.0)
                         for lbl in label_cols:
                             summary_data[f'test_back_{agg_name}_f1/{lbl}'] = m['per_label_f1'][lbl]
                             summary_data[f'test_back_{agg_name}_loss/{lbl}'] = m['per_label_loss'][lbl]
@@ -913,10 +919,10 @@ def train_and_evaluate(train_df: pd.DataFrame,
                     for cls in range(3):
                         log_data[f'ensemble_val_{agg_name}_counts/{lbl}_{cls}'] = m['pred_counts'][lbl][cls]
             for agg_name, m in test_ensemble_metrics.items():
-                log_data[f'ensemble_test_back_{agg_name}_f1_macro'] = m['f1_macro']
-                log_data[f'ensemble_test_back_{agg_name}_f1_micro'] = m['f1_micro']
-                log_data[f'ensemble_test_back_{agg_name}_acc'] = m['acc']
-                log_data[f'ensemble_test_back_{agg_name}_loss_macro'] = m.get('loss_macro', 0.0)
+                log_data[f'ensemble_test_back_global/ensemble_test_back_{agg_name}_f1_macro'] = m['f1_macro']
+                log_data[f'ensemble_test_back_global/ensemble_test_back_{agg_name}_f1_micro'] = m['f1_micro']
+                log_data[f'ensemble_test_back_global/ensemble_test_back_{agg_name}_acc'] = m['acc']
+                log_data[f'ensemble_test_back_global/ensemble_test_back_{agg_name}_loss_macro'] = m.get('loss_macro', 0.0)
                 for lbl in label_cols:
                     log_data[f'ensemble_test_back_{agg_name}_f1/{lbl}'] = m['per_label_f1'][lbl]
                     log_data[f'ensemble_test_back_{agg_name}_loss/{lbl}'] = m['per_label_loss'][lbl]
