@@ -17,6 +17,29 @@ import cv2
 import numpy as np
 import albumentations as A
 
+import numpy as np
+import cv2
+
+def _brain_centroid_radius(x2d: np.ndarray) -> tuple[float,float,float]:
+    # x2d: HxW float32 (antes de ToTensorV2)
+    h, w = x2d.shape
+    # umbral robusto
+    thr = np.percentile(x2d, 75)
+    mask = (x2d > thr).astype(np.uint8)
+    # limpia
+    mask = cv2.medianBlur(mask*255, 5)
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num <= 1:
+        return 0.5, 0.5, 0.3  # fallback
+    # ignora fondo (índice 0)
+    idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    cx, cy = centroids[idx]               # (x, y)
+    area = stats[idx, cv2.CC_STAT_AREA]
+    r = np.sqrt(area/np.pi)               # radio equivalente
+    # normaliza
+    return float(cx/w), float(cy/h), float(2*r/max(h,w))
+
+
 class RandomZipperStripe(A.ImageOnlyTransform):
     """
     Zipper sintético eficiente en memoria.

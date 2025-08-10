@@ -232,17 +232,6 @@ class Model2DTimm(nn.Module):
         else:
             raise ValueError(f"Unknown head_type: {head_type}")
 
-
-        # en Model2DTimm.__init__
-        self.reg_head = nn.Sequential(
-            nn.LayerNorm(feat_dim),
-            nn.Linear(feat_dim, feat_dim // 2),
-            nn.GELU(),
-            nn.Dropout(0.05),
-            nn.Linear(feat_dim // 2, 3),
-            nn.Sigmoid(),  # porque el target lo normalizamos a [0,1]
-        )
-
     def forward(self, x: torch.Tensor, view: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Extract features from backbone
         feats = self.backbone(x)  # (B, feat_dim)
@@ -253,5 +242,4 @@ class Model2DTimm(nn.Module):
             v_emb = self.view_emb(view)
             feats = feats + v_emb
         logits = self.head(feats)  # (B, num_labels, num_classes)
-        aux    = self.reg_head(feats)      # (B, 3) -> (cx, cy, r) en [0,1]
-        return logits,aux
+        return logits

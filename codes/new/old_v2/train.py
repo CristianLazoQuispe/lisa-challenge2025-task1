@@ -76,8 +76,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--epochs', type=int, default=30, help='Maximum number of epochs per fold')
     parser.add_argument('--patience', type=int, default=5, help='Number of epochs without improvement before stopping')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--lambda_aux', type=float, default=0.2, help='lambda_aux for centroid of brain')
-    
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
     parser.add_argument('--base_model', type=str, default='maxvit_tiny_tf_512.in1k', help='timm model name')
     parser.add_argument('--head_type', type=str, default='label_tokens', choices=['simple', 'label_tokens'], help='Type of classification head')
@@ -339,5 +337,5 @@ if __name__ == '__main__':
     --do_inference
     
     
-    python train.py     --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/lisa_clean_label_tokens_testback2_z_newaug_pos     --experiment_name lisa_clean_label_tokens_testback2_z_newaug_pos     --norm_mode dataset_z_per_view     --device cuda:1     --slice_frac  0.99     --dynamic_w 0.25,0.5,1.0     --epochs 5000     --patience 100     --image_size 256     --batch_size 32     --lr 1e-5     --base_model maxvit_nano_rw_256.sw_in1k     --head_type label_tokens     --use_view     --aggregators mean vote max weighted     --volume_id patient_id     --n_splits 5     --top_k 2 --threshold_brain_presence 0.05  --lambda_aux 0.2  --do_inference
+    python train.py     --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/lisa_clean_label_tokens_testback2_z_newaug     --experiment_name lisa_clean_label_tokens_testback2_z_newaug     --norm_mode dataset_z_per_view     --device cuda:1     --slice_frac  0.99     --dynamic_w 0.25,0.5,1.0     --epochs 5000     --patience 100     --image_size 256     --batch_size 32     --lr 1e-5     --base_model maxvit_nano_rw_256.sw_in1k     --head_type label_tokens     --use_view     --aggregators mean vote max weighted     --volume_id patient_id     --n_splits 5     --top_k 2 --threshold_brain_presence 0.1    --do_inference
     """

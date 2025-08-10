@@ -48,7 +48,6 @@ if current_path not in sys.path:
 
 import new_augmentations
 
-
 class MRIDataset2D(Dataset):
     """Dataset that loads individual 2D slices extracted from 3D NIfTI volumes.
 
@@ -150,7 +149,7 @@ class MRIDataset2D(Dataset):
         if not use_augmentation:
             return A.Compose(base_transforms)
         aug_transforms = [
-            new_augmentations.CenterDeBorder(max_crop=0.1, p=0.2), #, min_keep=8
+            new_augmentations.CenterDeBorder(max_crop=0.1, p=0.3), #, min_keep=8
             # Slight random rotation around the slice plane
             A.HorizontalFlip(p=0.2),
             A.VerticalFlip(p=0.2),
@@ -173,7 +172,6 @@ class MRIDataset2D(Dataset):
                 A.MedianBlur(blur_limit=(3,21), p=1.0),
             ], p=0.3),
 
-            #"""
             A.OneOf([
                 A.MultiplicativeNoise(multiplier=(0.95, 1.2), p=1.0),   # cambia el contraste levemente
                 A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1,p=1.0),
@@ -181,7 +179,6 @@ class MRIDataset2D(Dataset):
                 new_augmentations.RandomZipperStripe(p=1.0, max_amp=0.18, min_period=6, max_period=22, axis="rand"),
                 new_augmentations.RandomBandCut(p=1.0),
             ], p=0.3),
-            
 
         ]
         return A.Compose([A.Resize(image_size, image_size)] + aug_transforms + [ToTensorV2()])
@@ -293,13 +290,9 @@ class MRIDataset2D(Dataset):
         # Apply transforms to convert to tensor
         if self.transform:
             img = self.transform(image=img)['image']  # returns tensor (1, H, W)
-
-        img_np = img.numpy().squeeze()  # HxW float32, ya augmentado y recortado
-        aux = new_augmentations._brain_centroid_radius(img_np)
-        aux_tensor = torch.tensor(aux, dtype=torch.float32)
         if self.is_train:
             label_values = row[self.labels].values.astype(np.int64)
             labels_tensor = torch.tensor(label_values, dtype=torch.long)
-            return img, labels_tensor, full_path, view_onehot,aux_tensor
+            return img, labels_tensor, full_path, view_onehot
         else:
-            return img, -1, full_path, view_onehot,aux_tensor
+            return img, -1, full_path, view_onehot

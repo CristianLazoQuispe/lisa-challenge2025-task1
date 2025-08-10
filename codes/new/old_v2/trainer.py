@@ -94,10 +94,10 @@ def collect_slice_predictions(loader: DataLoader, model: nn.Module, device: torc
     results: List[Dict] = []
     model.eval()
     with torch.no_grad():
-        for x, y, path, view,aux_target in tqdm(loader, desc="Inference", leave=False):
+        for x, y, path, view in tqdm(loader, desc="Inference", leave=False):
             x = x.to(device, non_blocking=True)
             view = view.to(device, non_blocking=True)
-            y_hat,aux_pred = model(x, view) if 'view' in model.forward.__code__.co_varnames else model(x)
+            y_hat = model(x, view) if 'view' in model.forward.__code__.co_varnames else model(x)
             probs = softmax_logits(y_hat).cpu().numpy()  # (B,L,C)
             preds = np.argmax(probs, axis=-1)            # (B,L)
             y_np: Optional[np.ndarray] = None
@@ -627,19 +627,14 @@ def train_and_evaluate(train_df: pd.DataFrame,
             running_loss = 0.0
             nbatches = 0
             pbar = tqdm(train_loader, desc=f"Fold {fold} Epoch {epoch}", leave=False, dynamic_ncols=True)
-            for step, (x, y, _, view,aux_target) in enumerate(pbar, start=1):
+            for step, (x, y, _, view) in enumerate(pbar, start=1):
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 view = view.to(device, non_blocking=True)
-                aux_target = aux_target.to(device, non_blocking=True)  # (B,3) en [0,1]
-
                 optimizer.zero_grad(set_to_none=True)
                 with torch.cuda.amp.autocast():
-                    y_hat,aux_pred  = model(x, view) if args.get('use_view', False) else model(x)
-                    cls_loss = sum(criterions[i](y_hat[:, i], y[:, i]) for i in range(len(label_cols))) / len(label_cols)
-                    aux_loss = F.smooth_l1_loss(aux_pred, aux_target)
-                    loss = cls_loss + args.get("lambda_aux", 0.2) * aux_loss
-
+                    y_hat = model(x, view) if args.get('use_view', False) else model(x)
+                    loss = sum(criterions[i](y_hat[:, i], y[:, i]) for i in range(len(label_cols))) / len(label_cols)
                 grad_scaler.scale(loss).backward()
                 # Update optimizer
                 grad_scaler.unscale_(optimizer)
@@ -656,20 +651,15 @@ def train_and_evaluate(train_df: pd.DataFrame,
             val_loss_total = 0.0
             n_val_batches = 0
             with torch.no_grad():
-                for x_val, y_val, _, view_val,aux_target_val in val_loader:
+                for x_val, y_val, _, view_val in val_loader:
                     x_val   = x_val.to(device, non_blocking=True)
                     y_val   = y_val.to(device, non_blocking=True)
                     view_val= view_val.to(device, non_blocking=True)
-                    aux_target_val = aux_target_val.to(device, non_blocking=True)  # (B,3) en [0,1]
                     with torch.cuda.amp.autocast():
-                        y_hat_val,aux_pred_val = model(x_val, view_val) if args.get('use_view', False) else model(x_val)
-                        cls_loss_val = sum(
+                        y_hat_val = model(x_val, view_val) if args.get('use_view', False) else model(x_val)
+                        loss_val = sum(
                             criterions[i](y_hat_val[:, i], y_val[:, i]) for i in range(len(label_cols))
                         ) / len(label_cols)
-                        aux_loss_val = F.smooth_l1_loss(aux_pred_val, aux_target_val)
-                        loss_val = cls_loss_val + args.get("lambda_aux", 0.2) * aux_loss_val
-
-
                     val_loss_total += float(loss_val.item())
                     n_val_batches += 1
             val_loss_slice_level = val_loss_total / max(1, n_val_batches)
