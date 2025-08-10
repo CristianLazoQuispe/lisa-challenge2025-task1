@@ -31,7 +31,7 @@ from torch.utils.data import Dataset
 import torch
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-
+from . import new_augmentations
 
 class MRIDataset2D(Dataset):
     """Dataset that loads individual 2D slices extracted from 3D NIfTI volumes.
@@ -134,16 +134,37 @@ class MRIDataset2D(Dataset):
         if not use_augmentation:
             return A.Compose(base_transforms)
         aug_transforms = [
+            new_augmentations.CenterDeBorder(p=0.5),
             # Slight random rotation around the slice plane
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
             A.Rotate(limit=15, p=0.5),
+
             # Minor affine transformations (scale and translation)
-            A.Affine(scale=(0.9, 1.1), translate_percent=(0.0, 0.1), p=0.5),
+            A.OneOf([
+                # 🔎 Zoom + desplazamiento leve
+                #A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+                A.Affine(scale=(0.9, 1.1), translate_percent=(0.0, 0.1), rotate=(-15, 15), p=1.0),
+                # 🔳 Apagar zonas aleatorias (simula distorsión visual o falta de señal)
+                A.CoarseDropout(num_holes_range=(1,2), hole_height_range=(0.1, 0.2), hole_width_range=(0.1, 0.2), fill=0, p=1.0),
+                # 🖼️ Zoom tipo crop + resize (cambia FOV)
+                A.RandomResizedCrop(size=(512, 512), scale=(0.8, 1.0), ratio=(0.8, 1.2), p=1),
+            ], p=0.3),                        
             # One of mild noise or blur
             A.OneOf([
                 A.GaussNoise(std_range=(1e-5, 2e-1), mean_range=(0,1e-4), p=1.0),   # ruido muy leve
                 A.GaussianBlur(sigma_limit= (0.5,5), blur_limit=(3,20), p=1.0),                # desenfoque apenas perceptible
                 A.MedianBlur(blur_limit=(3,21), p=1.0),
             ], p=0.3),
+
+            A.OneOf([
+                A.MultiplicativeNoise(multiplier=(0.95, 1.2), p=1.0),   # cambia el contraste levemente
+                A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1,p=1.0),
+                A.CLAHE(clip_limit=2,p=1.0),
+            ], p=0.3),
+
+            new_augmentations.RandomZipperStripe(p=0.20, max_amp=0.18, min_period=6, max_period=22, axis="rand"),
+            new_augmentations.RandomBandCut(p=0.12),
         ]
         return A.Compose([A.Resize(image_size, image_size)] + aug_transforms + [ToTensorV2()])
 
