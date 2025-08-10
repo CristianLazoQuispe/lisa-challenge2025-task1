@@ -299,15 +299,21 @@ if __name__ == '__main__':
     --n_splits 5 \
     --top_k 0
 
+    1 0.25 0.5 0.75
+    2 0.25 0.5 1.0
+    3 0.25,0.25,1.0
+    4 0.25,0.5,0.5
+    5 0.1,0.25,0.75
+    6 0.25,0.75,1.0
 
     python train.py \
-    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/lisa_clean_label_tokens_testback_z_pruebis \
-    --experiment_name lisa_clean_label_tokens_testback_z \
+    --save_dir /data/cristian/projects/med_data/rise-miccai/task-1/2d_models/results/lisa_clean_label_tokens_testback6_z \
+    --experiment_name lisa_clean_label_tokens_testback6_z \
     --norm_mode dataset_z_per_view \
-    --device cuda:0 \
+    --device cuda:5 \
     --slice_frac  0.99 \
     --dynamic_w 0.25,0.75,1.0 \
-    --epochs 1 \
+    --epochs 5000 \
     --patience 100 \
     --image_size 256 \
     --batch_size 32 \
@@ -317,7 +323,7 @@ if __name__ == '__main__':
     --use_view \
     --aggregators mean vote max weighted \
     --volume_id patient_id \
-    --n_splits 2 \
+    --n_splits 5 \
     --top_k 2 \
     --do_inference
     """

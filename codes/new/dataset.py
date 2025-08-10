@@ -173,7 +173,7 @@ class MRIDataset2D(Dataset):
             Normalised slice as float32.
         """
         x = img.astype(np.float32)
-        mode = self.norm_mode or ("slice_z" if self.use_norma else "none")
+        mode = self.norm_mode or "none"
         #print("MODE : ",mode)
         #print("self.use_norma : ",self.use_norma)
         #print("MODE : ",mode)
@@ -247,7 +247,8 @@ class MRIDataset2D(Dataset):
             img = Image.open(row['img_path']).convert('L')
             img = np.array(img, dtype=np.float32)
         # Apply selected normalisation
-        img = self._apply_normalization(img, view_code)
+        if self.use_norma:
+            img = self._apply_normalization(img, view_code)
         # Expand to (H, W, 1) for Albumentations
         img = np.expand_dims(img, axis=-1)
         # Apply transforms to convert to tensor
