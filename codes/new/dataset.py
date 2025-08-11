@@ -34,7 +34,7 @@ from albumentations.pytorch import ToTensorV2
 import sys
 import gc
 import os
-
+import cv2
 import sys
 import gc
 import os
@@ -138,6 +138,44 @@ class MRIDataset2D(Dataset):
                 arr = joblib.load(path)
                 self.data[idx] = arr
 
+    """
+                new_augmentations.CenterDeBorder(max_crop=0.1, p=0.2), #, min_keep=8
+            # Slight random rotation around the slice plane
+            A.HorizontalFlip(p=0.15),
+            A.VerticalFlip(p=0.10),
+            A.Rotate(limit=10, p=0.5),
+
+            # Minor affine transformations (scale and translation)
+            A.OneOf([
+                # 🔎 Zoom + desplazamiento leve
+                #A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+                A.Affine(scale=(0.85, 1.15), translate_percent=(0.0, 0.1), rotate=(-15, 15),
+                         shear={'x': (-12, 12), 'y': (-6, 6)}, p=1.0),
+                # 🔳 Apagar zonas aleatorias (simula distorsión visual o falta de señal)
+                A.CoarseDropout(num_holes_range=(1,2), hole_height_range=(0.1, 0.2), hole_width_range=(0.1, 0.2), fill=0, p=1.0),
+                # 🖼️ Zoom tipo crop + resize (cambia FOV)
+                A.RandomResizedCrop(size=(image_size, image_size), scale=(0.8, 1.0), ratio=(0.8, 1.2), p=1),
+                #A.ShiftScaleRotate(shift_limit=0.28, scale_limit=0.15, rotate_limit=20, border_mode=cv2.BORDER_CONSTANT, fill=0, p=1.0),
+            ], p=0.3),                        
+            # One of mild noise or blur
+            A.OneOf([
+                A.GaussNoise(std_range=(1e-5, 2e-1), mean_range=(0,1e-4), p=1.0),   # ruido muy leve
+                A.GaussianBlur(sigma_limit= (0.5,5), blur_limit=(3,20), p=1.0),                # desenfoque apenas perceptible
+                A.MedianBlur(blur_limit=(3,21), p=1.0),
+            ], p=0.3),
+
+            #
+            A.OneOf([
+                A.MultiplicativeNoise(multiplier=(0.95, 1.2), p=1.0),   # cambia el contraste levemente
+                A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1,p=1.0),
+                A.CLAHE(clip_limit=2,p=1.0),
+            ], p=0.3),
+            A.OneOf([
+                new_augmentations.RandomZipperStripe(p=1.0, max_amp=0.18, min_period=6, max_period=22, axis="rand"),
+                new_augmentations.RandomBandCut(p=1.0),
+                A.NoOp(p=1.0),  # placeholder si no lo importas aquí
+            ], p=0.10)
+    """
     @staticmethod
     def _build_transform(image_size: int, use_augmentation: bool) -> A.Compose:
         """Construct an Albumentations transformation pipeline.
@@ -150,10 +188,10 @@ class MRIDataset2D(Dataset):
         if not use_augmentation:
             return A.Compose(base_transforms)
         aug_transforms = [
-            new_augmentations.CenterDeBorder(max_crop=0.1, p=0.2), #, min_keep=8
+            new_augmentations.CenterDeBorder(p=0.5),
             # Slight random rotation around the slice plane
-            A.HorizontalFlip(p=0.2),
-            A.VerticalFlip(p=0.2),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
             A.Rotate(limit=15, p=0.5),
 
             # Minor affine transformations (scale and translation)
@@ -173,15 +211,14 @@ class MRIDataset2D(Dataset):
                 A.MedianBlur(blur_limit=(3,21), p=1.0),
             ], p=0.3),
 
-            #"""
             A.OneOf([
                 A.MultiplicativeNoise(multiplier=(0.95, 1.2), p=1.0),   # cambia el contraste levemente
                 A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1,p=1.0),
                 A.CLAHE(clip_limit=2,p=1.0),
-                new_augmentations.RandomZipperStripe(p=1.0, max_amp=0.18, min_period=6, max_period=22, axis="rand"),
-                new_augmentations.RandomBandCut(p=1.0),
             ], p=0.3),
-            
+
+            new_augmentations.RandomZipperStripe(p=0.20, max_amp=0.18, min_period=6, max_period=22, axis="rand"),
+            new_augmentations.RandomBandCut(p=0.12),
 
         ]
         return A.Compose([A.Resize(image_size, image_size)] + aug_transforms + [ToTensorV2()])
@@ -295,8 +332,11 @@ class MRIDataset2D(Dataset):
             img = self.transform(image=img)['image']  # returns tensor (1, H, W)
 
         img_np = img.numpy().squeeze()  # HxW float32, ya augmentado y recortado
-        aux = new_augmentations._brain_centroid_radius(img_np)
-        aux_tensor = torch.tensor(aux, dtype=torch.float32)
+        #x_,y_,r_ = new_augmentations._brain_centroid_radius(img_np)
+        top, bottom, left, right = new_augmentations._brain_margins_connected(img_np)
+        
+
+        aux_tensor = torch.tensor([top, bottom, left, right], dtype=torch.float32)
         if self.is_train:
             label_values = row[self.labels].values.astype(np.int64)
             labels_tensor = torch.tensor(label_values, dtype=torch.long)

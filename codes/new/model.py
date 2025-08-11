@@ -239,7 +239,7 @@ class Model2DTimm(nn.Module):
             nn.Linear(feat_dim, feat_dim // 2),
             nn.GELU(),
             nn.Dropout(0.05),
-            nn.Linear(feat_dim // 2, 3),
+            nn.Linear(feat_dim // 2, 4),
             nn.Sigmoid(),  # porque el target lo normalizamos a [0,1]
         )
 
