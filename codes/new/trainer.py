@@ -441,6 +441,80 @@ class DynamicFocalLoss2(nn.Module):
         loss = alpha_t * (1 - p_t) ** self.gamma * ce
         return loss.mean() if self.reduction == 'mean' else loss.sum()
 
+import torch
+
+def _yolo_to_corners(box: torch.Tensor) -> torch.Tensor:
+    """
+    box: (..., 4) con (cx, cy, w, h) en [0,1]
+    return: (..., 4) con (x1, y1, x2, y2) en [0,1]
+    """
+    cx, cy, w, h = box.unbind(-1)
+    x1 = cx - w * 0.5
+    y1 = cy - h * 0.5
+    x2 = cx + w * 0.5
+    y2 = cy + h * 0.5
+    return torch.stack([x1, y1, x2, y2], dim=-1)
+
+def _box_area_xyxy(box_xyxy: torch.Tensor) -> torch.Tensor:
+    w = (box_xyxy[..., 2] - box_xyxy[..., 0]).clamp(min=0)
+    h = (box_xyxy[..., 3] - box_xyxy[..., 1]).clamp(min=0)
+    return w * h
+
+@torch.no_grad()
+def iou_yolo(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    IoU entre cajas YOLO normalizadas.
+    box1, box2: tensores con shape (..., 4) en formato (cx, cy, w, h), valores en [0,1].
+                 Se permite broadcasting en las dimensiones iniciales.
+    return: IoU con shape broadcasted (...,)
+
+    Ej.: box1.shape = (B,4), box2.shape = (B,4)  -> IoU shape (B,)
+         box1.shape = (B,4), box2.shape = (1,4)  -> IoU shape (B,)
+    """
+    b1 = _yolo_to_corners(box1)
+    b2 = _yolo_to_corners(box2)
+
+    # intersección
+    x1 = torch.max(b1[..., 0], b2[..., 0])
+    y1 = torch.max(b1[..., 1], b2[..., 1])
+    x2 = torch.min(b1[..., 2], b2[..., 2])
+    y2 = torch.min(b1[..., 3], b2[..., 3])
+
+    inter = _box_area_xyxy(torch.stack([x1, y1, x2, y2], dim=-1))
+    area1 = _box_area_xyxy(b1)
+    area2 = _box_area_xyxy(b2)
+    union = area1 + area2 - inter
+    return inter / (union + eps)
+
+@torch.no_grad()
+def giou_yolo(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Generalized IoU para cajas en formato YOLO normalizado.
+    return: GIoU con shape broadcasted (...,)
+    """
+    b1 = _yolo_to_corners(box1)
+    b2 = _yolo_to_corners(box2)
+
+    # IoU normal
+    x1 = torch.max(b1[..., 0], b2[..., 0])
+    y1 = torch.max(b1[..., 1], b2[..., 1])
+    x2 = torch.min(b1[..., 2], b2[..., 2])
+    y2 = torch.min(b1[..., 3], b2[..., 3])
+    inter = _box_area_xyxy(torch.stack([x1, y1, x2, y2], dim=-1))
+    area1 = _box_area_xyxy(b1)
+    area2 = _box_area_xyxy(b2)
+    union = area1 + area2 - inter
+    iou = inter / (union + eps)
+
+    # caja envolvente mínima
+    cx1 = torch.min(b1[..., 0], b2[..., 0])
+    cy1 = torch.min(b1[..., 1], b2[..., 1])
+    cx2 = torch.max(b1[..., 2], b2[..., 2])
+    cy2 = torch.max(b1[..., 3], b2[..., 3])
+    c_area = _box_area_xyxy(torch.stack([cx1, cy1, cx2, cy2], dim=-1))
+
+    giou = iou - (c_area - union) / (c_area + eps)
+    return giou
 
 
 def train_and_evaluate(train_df: pd.DataFrame,
@@ -578,7 +652,14 @@ def train_and_evaluate(train_df: pd.DataFrame,
             head_config=args.get('head_config', {}),
             use_view=args.get('use_view', False),
         ).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.get('lr', 1e-4), weight_decay=args.get('weight_decay', 1e-4))
+        #optimizer = torch.optim.Adam(model.parameters(), lr=args.get('lr', 1e-4), weight_decay=args.get('weight_decay', 1e-4))
+        optimizer = torch.optim.Adam([
+            {"params": model.backbone.parameters(),"lr":args.get('lr', 1e-4)},
+            {"params": model.view_emb.parameters(),"lr":args.get('lr', 1e-4)},
+            {"params": model.head.parameters(),"lr":args.get('lr', 1e-4)},
+            {"params": model.reg_head.parameters(),"lr":5*args.get('lr', 1e-4)}],
+            weight_decay=args.get('weight_decay', 1e-4)
+        )
         grad_scaler = torch.cuda.amp.GradScaler(enabled=True)
         scheduler   = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='max', factor=0.95, patience=args.get('scheduler_patience', 5)
@@ -637,8 +718,13 @@ def train_and_evaluate(train_df: pd.DataFrame,
                 with torch.cuda.amp.autocast():
                     y_hat,aux_pred  = model(x, view) if args.get('use_view', False) else model(x)
                     cls_loss = sum(criterions[i](y_hat[:, i], y[:, i]) for i in range(len(label_cols))) / len(label_cols)
-                    aux_loss = F.smooth_l1_loss(aux_pred, aux_target)
-                    loss = cls_loss + args.get("lambda_aux", 0.2) * aux_loss
+                    
+                    #aux_loss = F.smooth_l1_loss(aux_pred, aux_target)
+                    #loss = cls_loss + args.get("lambda_aux", 0.2) * aux_loss
+                    aux_l1  = torch.nn.functional.smooth_l1_loss(aux_pred, aux_target)
+                    aux_giou = (1.0 - giou_yolo(aux_pred, aux_target)).mean()
+                    aux_loss = 0.5 * aux_l1 + 0.5 * aux_giou
+                    loss = cls_loss + args.get("lambda_aux", 0.5) * aux_loss   # súbelo a 0.3–1.0 para probar
 
                 grad_scaler.scale(loss).backward()
                 # Update optimizer
@@ -666,8 +752,13 @@ def train_and_evaluate(train_df: pd.DataFrame,
                         cls_loss_val = sum(
                             criterions[i](y_hat_val[:, i], y_val[:, i]) for i in range(len(label_cols))
                         ) / len(label_cols)
-                        aux_loss_val = F.smooth_l1_loss(aux_pred_val, aux_target_val)
-                        loss_val = cls_loss_val + args.get("lambda_aux", 0.2) * aux_loss_val
+                        #aux_loss_val = F.smooth_l1_loss(aux_pred_val, aux_target_val)
+                        #loss_val = cls_loss_val + args.get("lambda_aux", 0.2) * aux_loss_val
+
+                        aux_l1_val  = torch.nn.functional.smooth_l1_loss(aux_pred_val, aux_target_val)
+                        aux_giou_val = (1.0 - giou_yolo(aux_pred_val, aux_target_val)).mean()
+                        aux_loss_val = 0.5 * aux_l1_val + 0.5 * aux_giou_val
+                        loss_val = cls_loss_val + args.get("lambda_aux", 0.5) * aux_loss_val   # súbelo a 0.3–1.0 para probar
 
 
                     val_loss_total += float(loss_val.item())

@@ -169,6 +169,81 @@ class LabelTokenHead(nn.Module):
         return logits
 
 
+class RegHead(nn.Module):
+    def __init__(self, feat_dim):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Linear(feat_dim, feat_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.05),
+        )
+        self.out = nn.Linear(feat_dim // 2, 4)
+        # init bias cerca del promedio del dataset (mejor que 0.5 fijo)
+        # si aún no lo tienes, arranca algo razonable:
+        with torch.no_grad():
+            # logit(0.5)=0; w,h un poco menores (ej. 0.35)
+            self.out.bias[:] = torch.tensor([0.0, 0.0, -0.62, -0.62])  # sigmoid(-0.62)~0.35
+
+    def forward(self, feats):
+        t = self.trunk(feats)               # (B, d)
+        o = self.out(t)                     # (B,4)
+        # parametrización estable:
+        cx = torch.sigmoid(o[..., 0])
+        cy = torch.sigmoid(o[..., 1])
+        w  = torch.sigmoid(o[..., 2])
+        h  = torch.sigmoid(o[..., 3])
+        return torch.stack([cx, cy, w, h], dim=-1)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+
+def spatial_softargmax2d(attn):  # attn: (B,1,H,W) -> cx,cy en [0,1]
+    B, _, H, W = attn.shape
+    attn = attn.view(B, -1)
+    attn = F.softmax(attn, dim=-1)
+    attn = attn.view(B, 1, H, W)
+    # coordenadas normalizadas [0,1]
+    ys = torch.linspace(0, 1, H, device=attn.device).view(1, 1, H, 1).expand(B, 1, H, W)
+    xs = torch.linspace(0, 1, W, device=attn.device).view(1, 1, 1, W).expand(B, 1, H, W)
+    cy = (attn * ys).sum(dim=(2,3))
+    cx = (attn * xs).sum(dim=(2,3))
+    return cx.squeeze(1), cy.squeeze(1)
+
+class RegHeadSpatial(nn.Module):
+    """Head de bbox con información espacial.
+       Predice: heatmap de centro (1 canal) + tamaño (2 canales: w,h).
+       Devuelve cajas normalizadas (cx, cy, w, h) en [0,1].
+    """
+    def __init__(self, in_ch, hidden=128):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, hidden, 3, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.GELU(),
+        )
+        self.center_head = nn.Conv2d(hidden, 1, 1)      # heatmap
+        self.size_head   = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(hidden, 2, 1)                     # w,h (log-scale)
+        )
+
+    def forward(self, fmap):                # fmap: (B,C,Hf,Wf)
+        h = self.conv(fmap)
+        heat = self.center_head(h)          # (B,1,Hf,Wf)
+        cx, cy = spatial_softargmax2d(heat) # [0,1], diferenciable
+        sz = self.size_head(h).flatten(1)   # (B,2)
+        # tamaños en (0,1) con softplus para estabilidad
+        w = torch.sigmoid(sz[:, 0])
+        h = torch.sigmoid(sz[:, 1])
+        return torch.stack([cx, cy, w, h], dim=-1)      # (B,4)
+
+
 class Model2DTimm(nn.Module):
     """Backbone + multi‑label head model for 2D MRI slices.
 
@@ -234,24 +309,39 @@ class Model2DTimm(nn.Module):
 
 
         # en Model2DTimm.__init__
-        self.reg_head = nn.Sequential(
-            nn.LayerNorm(feat_dim),
-            nn.Linear(feat_dim, feat_dim // 2),
-            nn.GELU(),
-            nn.Dropout(0.05),
-            nn.Linear(feat_dim // 2, 4),
-            nn.Sigmoid(),  # porque el target lo normalizamos a [0,1]
-        )
+        #self.reg_head = nn.Sequential(
+        #    nn.LayerNorm(feat_dim),
+        #    nn.Linear(feat_dim, feat_dim // 2),
+        #    nn.GELU(),
+        #    nn.Dropout(0.05),
+        #    nn.Linear(feat_dim // 2, 4),
+        #    nn.Sigmoid(),  # porque el target lo normalizamos a [0,1]
+        #)
+
+        #self.reg_head = RegHead(feat_dim)
+        in_ch = getattr(self.backbone, 'feature_info', None)
+        in_ch = in_ch[-1]['num_chs'] if in_ch is not None else feat_dim
+        self.reg_head = RegHeadSpatial(in_ch)
+
 
     def forward(self, x: torch.Tensor, view: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Extract features from backbone
-        feats = self.backbone(x)  # (B, feat_dim)
+        #feats = self.backbone(x)  # (B, feat_dim)
+        #if self.use_view:
+        #    if view is None:
+        #        raise ValueError("Model configured with use_view=True but no view tensor provided")
+        #    # view: (B, 3) -> embed to (B, feat_dim)
+        #    v_emb = self.view_emb(view)
+        #    feats = feats + v_emb
+        #logits = self.head(feats)  # (B, num_labels, num_classes)
+        #aux    = self.reg_head(feats)      # (B, 3) -> (cx, cy, r) en [0,1]
+        #return logits,aux
+        # fmap espacial
+        fmap = self.backbone.forward_features(x)  # (B,C,Hf,Wf)
+        # vector global para clasificación
+        feats = self.backbone.forward_head(fmap, pre_logits=True)  # (B, feat_dim)
         if self.use_view:
-            if view is None:
-                raise ValueError("Model configured with use_view=True but no view tensor provided")
-            # view: (B, 3) -> embed to (B, feat_dim)
-            v_emb = self.view_emb(view)
-            feats = feats + v_emb
-        logits = self.head(feats)  # (B, num_labels, num_classes)
-        aux    = self.reg_head(feats)      # (B, 3) -> (cx, cy, r) en [0,1]
-        return logits,aux
+            v_emb = self.view_emb(view); feats = feats + v_emb
+        logits = self.head(feats)               # (B,L,3)
+        bbox   = self.reg_head(fmap)            # (B,4) -> (cx,cy,w,h) normalizados
+        return logits, bbox
