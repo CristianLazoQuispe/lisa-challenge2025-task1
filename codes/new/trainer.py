@@ -656,7 +656,7 @@ def train_and_evaluate(train_df: pd.DataFrame,
         optimizer = torch.optim.Adam([
             {"params": model.backbone.parameters(),"lr":args.get('lr', 1e-4)},
             {"params": model.view_emb.parameters(),"lr":args.get('lr', 1e-4)},
-            {"params": model.head.parameters(),"lr":args.get('lr', 1e-4)},
+            {"params": model.head.parameters(),    "lr":args.get('lr', 1e-4)},
             {"params": model.reg_head.parameters(),"lr":5*args.get('lr', 1e-4)}],
             weight_decay=args.get('weight_decay', 1e-4)
         )
