@@ -1,6 +1,6 @@
 import torch
-import cv2
-import matplotlib.pyplot as plt
+#import cv2
+#import matplotlib.pyplot as plt
 from torch.utils.data import Dataset
 import numpy as np
 from monai.transforms import (
@@ -8,6 +8,10 @@ from monai.transforms import (
     ScaleIntensityd, EnsureTyped, Resized,Spacingd,
     RandFlipd, RandAffined, RandZoomd, Compose
 )
+from monai.utils import set_determinism
+import torch
+
+set_determinism(42)
 
 # 🔧 Clase personalizada para reorientar el volumen según view_axis
 class ReorientToViewAxisd:
@@ -76,7 +80,10 @@ class MRIDataset3D(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         image_path = row["path"]
-        view_axis  = image_path.split("_LF_")[-1].split(".nii")[0]
+        if "_LF_" in image_path:
+            view_axis  = image_path.split("_LF_")[-1].split(".nii")[0]
+        else:
+            view_axis  = image_path.split("_lf_")[-1].split(".nii")[0]
         sample = {
             "image": image_path,
             "view_axis": view_axis,

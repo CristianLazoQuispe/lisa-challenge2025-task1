@@ -1,6 +1,16 @@
+import os
+import sys
 from scipy.ndimage import binary_erosion, binary_dilation, generate_binary_structure
-from .dataset3D import MRIDataset3D
+# Ruta absoluta del script actual
+current_path = os.path.dirname(os.path.abspath(__file__))
+
+# Agregar al sys.path si no está
+if current_path not in sys.path:
+    sys.path.append(current_path)
+
+from dataset3D import MRIDataset3D
 import matplotlib.pyplot as plt
+from joblib import dump
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
@@ -58,10 +68,12 @@ class PreProcessing3Dto2D:
                 mask, ratio     = self.morphological_operations(original)
                 mask = np.array(mask, dtype=np.float32)
                 img_path = os.path.join(destination_dir,filename.replace(".nii.gz",f"_{idx_slice}.png"))
+                pkl_path = os.path.join(destination_dir,filename.replace(".nii.gz",f"_{idx_slice}.pkl"))
                 npy_path = os.path.join(destination_dir,filename.replace(".nii.gz",f"_{idx_slice}.npy"))
                 #print(img_path)
-
                 np.save(npy_path, volume[idx_slice])
+                slice_ = np.load(npy_path)
+                dump(slice_,pkl_path)
                 plt.imsave(img_path, volume[idx_slice], cmap="gray")
 
                 values= {"filename":filename,"img_path":img_path,"npy_path":npy_path,"ratio":ratio}

@@ -1,29 +1,418 @@
-import os, random, torch
+"""
+Training loop and evaluation utilities for the LISA 2025 challenge.
+
+This module implements cross‑validation training with stratified splits,
+per‑label class weighting, multiple aggregation strategies for combining
+slice predictions into volume predictions, and comprehensive logging to
+Weights & Biases (WandB).  It relies on the dataset and model modules
+defined in this repository and uses the utility functions from
+``new_repo.utils`` for fold assignment and weight computation.
+
+Key features
+------------
+
+* **Cross‑validation training**: Uses stratified group K‑fold splitting
+  by patient to ensure that volumes from the same patient do not appear
+  in both training and validation sets.  The user specifies ``n_splits``.
+
+* **Class balancing**: Weights are computed per label using either
+  class‑balanced effective numbers or inverse frequency.  These weights
+  can be used with CrossEntropy or Focal loss to mitigate class
+  imbalance.
+
+* **Aggregation strategies**: Because volumes are represented by many
+  slices, the raw predictions must be aggregated into a single score per
+  volume.  Four strategies are provided: ``mean`` (average
+  probabilities), ``vote`` (majority class per label), ``max`` (class
+  corresponding to the maximum probability across slices) and ``weighted``
+  (weighted average of probabilities, currently uniform weights).  All
+  strategies are evaluated on validation and test sets, and their F1
+  scores and class distributions are logged to WandB.
+
+* **WandB integration**: Runs are configured via environment variables
+  ``WANDB_API_KEY``, ``PROJECT_WANDB`` and ``ENTITY``.  Metrics for
+  training loss, validation F1 and counts of predicted classes are
+  logged.  Aggregation results are recorded under keys like
+  ``val_mean_f1_macro``.  Users can monitor the training live.
+
+Usage
+-----
+
+The primary entry point is ``train_and_evaluate``, which accepts data
+frames for training and an optional validation dataset (``test_back_df``)
+with known labels for additional evaluation.  After training, the
+function returns a dictionary with aggregated results and saves model
+weights to disk.  See the main script ``train.py`` for an example
+command‑line interface.
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import joblib
+from typing import Iterable, List, Dict, Tuple, Optional
+
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
-from sklearn.metrics import f1_score, accuracy_score
-from torch.utils.data import DataLoader, WeightedRandomSampler
+import torch
 import torch.nn as nn
-import logging
-import wandb
-
-from .losses import get_per_label_criterions
-from .dataset2D import MRIDataset2D
-from .dataset3D import MRIDataset3D
-from .models2D import Model2DTimm
-from .models3D import Model3DResnet
-from .mywandb import init_wandb
-from .mixup import mixup_data
-import scipy.stats
-from . import utils
-
-from collections import deque
-import numpy as np
+#from sklearn.metrics import f1_score, accuracy_score
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import sys
+# Ruta absoluta del script actual
+current_path = os.path.dirname(os.path.abspath(__file__))
 
-def epoch_subsample(df, frac=0.5, seed=None):
-    # Submuestrea dentro de cada paciente sin el warning
+# Agregar al sys.path si no está
+if current_path not in sys.path:
+    sys.path.append(current_path)
+
+from dataset import MRIDataset2D
+from model import Model2DTimm
+from utils import (assign_patient_stratified_folds, assign_volume_stratified_folds,
+                    compute_weights_from_df, compute_sample_weights, set_seed)
+
+
+def softmax_logits(y_hat: torch.Tensor) -> torch.Tensor:
+    """Compute softmax over the class dimension for each label.
+
+    ``y_hat`` has shape (B, L, C).  Returns a tensor of the same shape
+    containing probabilities.
+    """
+    # Stack softmax per label
+    return torch.stack([
+        torch.softmax(y_hat[:, i], dim=-1) for i in range(y_hat.shape[1])
+    ], dim=1)
+
+
+def collect_slice_predictions(loader: DataLoader, model: nn.Module, device: torch.device) -> List[Dict]:
+    """Run inference on a dataloader and collect per‑slice predictions.
+
+    Returns a list of dictionaries, each containing the following keys:
+    ``'path'`` (slice path), ``'probs'`` (numpy array of shape (L, C)),
+    ``'preds'`` (numpy array of shape (L,)), and ``'true'`` (numpy array
+    of shape (L,) or ``None`` if labels are not available).
+    """
+    results: List[Dict] = []
+    model.eval()
+    with torch.no_grad():
+        for x, y, path, view,aux_target in tqdm(loader, desc="Inference", leave=False):
+            x = x.to(device, non_blocking=True)
+            view = view.to(device, non_blocking=True)
+            y_hat,aux_pred = model(x, view)# if 'view' in model.forward.__code__.co_varnames else model(x)
+            probs = softmax_logits(y_hat).cpu().numpy()  # (B,L,C)
+            preds = np.argmax(probs, axis=-1)            # (B,L)
+            y_np: Optional[np.ndarray] = None
+            # Determine if true labels are available.  In the test set the
+            # dataset returns ``y = -1`` (scalar) or a 1‑D tensor of -1s; in
+            # that case we omit the labels.  When training/validation the
+            # labels have shape (B, L).
+            if isinstance(y, torch.Tensor):
+                # If y is 2‑D (batch, labels) then labels exist
+                if y.ndim > 1:
+                    y_np = y.cpu().numpy()
+                # If y is 1‑D (batch,), check if it's not all -1
+                elif y.ndim == 1 and y.numel() > 0 and (y[0].item() != -1):
+                    y_np = y.unsqueeze(1).cpu().numpy()
+            for i in range(len(path)):
+                results.append({
+                    'path': path[i],
+                    'probs': probs[i],
+                    'preds': preds[i],
+                    'true': y_np[i] if y_np is not None else None,
+                })
+    return results
+
+def compute_stats_per_view(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    """
+    Compute clipping percentiles and mean/std for each view code based on
+    the slices in ``df``.  Returns a dictionary mapping view code to
+    ``{'p1', 'p99', 'mean', 'std'}`` used for dataset_z_per_view normalisation.
+    """
+    import numpy as np
+    import os
+    stats: Dict[str, Dict[str, float]] = {}
+    buckets: Dict[str, List[np.ndarray]] = {}
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        path = row.get('npy_path')# or row.get('img_path') or row.get('path') or row.get('filename')
+        if not path:
+            continue
+        # Determine view code from file name
+        view_code = 'axi'
+        try:
+            base_name = os.path.basename(path)
+            if '_LF_' in base_name:
+                view_code = base_name.split('_LF_')[-1].split('_')[0]
+        except Exception:
+            view_code = 'axi'
+        # Load array (support .npy or .pkl)
+        load_path = path
+        if load_path.endswith('.npy'):
+            load_path = load_path.replace('.npy', '.pkl')
+        arr = joblib.load(load_path).astype(np.float32)
+        buckets.setdefault(view_code, []).append(arr.ravel())
+    for view, arrs in buckets.items():
+        if not arrs:
+            continue
+        x = np.concatenate(arrs)
+        p1 = np.percentile(x, 1)
+        p99 = np.percentile(x, 99)
+        x_clip = np.clip(x, p1, p99)
+        mu = x_clip.mean()
+        sigma = x_clip.std() + 1e-6
+        stats[view] = {
+            'p1': float(p1),
+            'p99': float(p99),
+            'mean': float(mu),
+            'std': float(sigma),
+        }
+    print("COMPUTED! dataset_z_per_view")
+    return stats
+
+
+def aggregate_slices(results: List[Dict], num_labels: int, num_classes: int,
+                     aggregator: str = 'mean', weights: Optional[np.ndarray] = None
+                     ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], List[str]]:
+    """Aggregate slice predictions into volume predictions using a given strategy.
+
+    Parameters
+    ----------
+    results: list of dicts
+        Output of ``collect_slice_predictions``.
+    num_labels: int
+        Number of labels per slice.
+    num_classes: int
+        Number of discrete classes (e.g. 3).
+    aggregator: str, default='mean'
+        Aggregation strategy: one of ``'mean'``, ``'vote'``, ``'max'`` or
+        ``'weighted'``.  See below for definitions.
+    weights: Optional[np.ndarray]
+        Optional weights for the weighted average.  Must have shape
+        (n_slices,).  If ``None`` and ``aggregator`` is ``'weighted'``, all
+        slices are weighted equally.
+
+    Returns
+    -------
+    y_pred: np.ndarray of shape (N_volumes, num_labels)
+        Predicted class per label for each volume.
+    y_prob: np.ndarray of shape (N_volumes, num_labels, num_classes)
+        Aggregated probabilities per label and class.
+    y_true: Optional[np.ndarray]
+        True labels per volume (if available).  ``None`` if no ground
+        truths were provided in ``results``.
+    vol_names: list of str
+        Names of the volumes (derived from slice paths).
+
+    Aggregation strategies
+    ----------------------
+
+    * ``mean``: probabilities are averaged across slices.
+    * ``vote``: for each label, take the class with the highest count
+      among slice‑level predictions.
+    * ``max``: for each label, take the class corresponding to the
+      maximum probability observed among all slices (max‑pooling).
+    * ``weighted``: probabilities are combined via a weighted average.
+      If ``weights`` is ``None``, equal weights are used.
+    """
+    # Group by volume name: strip slice index and suffix
+    volume_groups: Dict[str, List[Dict]] = {}
+    for item in results:
+        # Derive volume name: remove last underscore and digits from base name
+        # Example: path '.../LISA_0001_LF_axi_023.png' -> 'LISA_0001_LF_axi.nii.gz'
+        base = os.path.basename(item['path'])
+        # Remove extension
+        name_no_ext = os.path.splitext(base)[0]
+        parts = name_no_ext.split('_')
+        if parts[-1].isdigit():
+            parts = parts[:-1]
+        vol_name = '_'.join(parts) + '.nii.gz'
+        volume_groups.setdefault(vol_name, []).append(item)
+    # Aggregate predictions per volume
+    vol_names = list(volume_groups.keys())
+    print("vol_names:",vol_names)
+    n_vols = len(vol_names)
+    y_pred = np.zeros((n_vols, num_labels), dtype=int)
+    y_prob = np.zeros((n_vols, num_labels, num_classes), dtype=float)
+    y_true = None
+    # Determine if we have ground truths
+    has_true = any(item['true'] is not None for item in results)
+    if has_true:
+        y_true = np.zeros((n_vols, num_labels), dtype=int)
+    for i, name in enumerate(vol_names):
+        group = volume_groups[name]
+        # Stack per‑slice predictions
+        probs = np.stack([item['probs'] for item in group], axis=0)    # (n_slices, L, C)
+        preds = np.stack([item['preds'] for item in group], axis=0)    # (n_slices, L)
+        # Combine according to aggregator
+        if aggregator == 'mean':
+            agg_probs = np.mean(probs, axis=0)  # (L,C)
+            agg_pred = np.argmax(agg_probs, axis=1)  # (L,)
+        elif aggregator == 'vote':
+            agg_probs = np.mean(probs, axis=0)  # still compute mean for completeness
+            # majority vote per label
+            agg_pred = []
+            for lbl in range(num_labels):
+                counts = np.bincount(preds[:, lbl], minlength=num_classes)
+                agg_pred.append(np.argmax(counts))
+            agg_pred = np.array(agg_pred, dtype=int)
+        elif aggregator == 'max':
+            agg_probs = np.max(probs, axis=0)
+            agg_pred = np.argmax(agg_probs, axis=1)
+        elif aggregator == 'weighted':
+            # Weighted average across slices
+            n_slices = probs.shape[0]
+            if weights is None:
+                w = np.ones(n_slices, dtype=float) / n_slices
+            else:
+                w = np.asarray(weights, dtype=float)
+                if w.shape[0] != n_slices:
+                    # broadcast or normalise weights per volume
+                    w = np.ones(n_slices, dtype=float) / n_slices
+                w = w / w.sum()
+            # Weighted average per label/class
+            agg_probs = np.tensordot(w, probs, axes=(0, 0))  # (L,C)
+            agg_pred = np.argmax(agg_probs, axis=1)
+        else:
+            raise ValueError(f"Unknown aggregator: {aggregator}")
+        y_prob[i] = agg_probs
+        y_pred[i] = agg_pred
+        if has_true:
+            # True labels: majority or mean rounding
+            trues = np.stack([item['true'] for item in group], axis=0)  # (n_slices, L)
+            # Majority vote for ground truth (should be consistent across slices)
+            # but in case of disagreement take the mean and round
+            avg_true = np.mean(trues, axis=0)
+            true_label = np.round(avg_true).astype(int)
+            y_true[i] = true_label
+    return y_pred, y_prob, y_true, vol_names
+
+class DynamicFocalLoss(torch.nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super(DynamicFocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        prob = F.softmax(inputs, dim=1)
+        p_t = torch.gather(prob, 1, targets.unsqueeze(1)).squeeze()
+        alpha_t = self.alpha * (1 - p_t) ** self.gamma
+        focal_loss = alpha_t * ce_loss
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+def evaluate_aggregators(results: List[Dict], label_cols: Iterable[str], num_classes: int = 3,
+                         aggregators: Iterable[str] = ('mean', 'vote', 'max', 'weighted')) -> Dict[str, Dict]:
+    """Evaluate multiple aggregation strategies on collected slice predictions.
+
+    Parameters
+    ----------
+    results: list of dicts
+        Output from ``collect_slice_predictions``.
+    label_cols: Iterable[str]
+        Names of the label columns.
+    num_classes: int
+        Number of classes per label.
+    aggregators: iterable of str
+        List of aggregator names to evaluate.
+
+    Returns
+    -------
+    metrics: dict
+        Dictionary keyed by aggregator name.  Each value is another
+        dictionary with keys:
+
+        - ``'f1_macro'``: macro F1 score across all labels.
+        - ``'f1_micro'``: micro F1 score across all labels.
+        - ``'acc'``: accuracy across all labels.
+        - ``'per_label_f1'``: dict mapping each label to its macro F1.
+        - ``'pred_counts'``: dict mapping each label to a dict of counts
+          for classes 0, 1, 2.
+    """
+    label_cols = list(label_cols)
+    num_labels = len(label_cols)
+    metrics: Dict[str, Dict] = {}
+    for agg in aggregators:
+        y_pred, y_prob, y_true, names = aggregate_slices(
+            results, num_labels=num_labels, num_classes=num_classes, aggregator=agg
+        )
+        # y_true may be None if test set has no labels
+        if y_true is None:
+            # Only return predictions and counts
+            pred_counts = {}
+            for i, col in enumerate(label_cols):
+                counts = np.bincount(y_pred[:, i], minlength=num_classes)
+                pred_counts[col] = {cls: int(counts[cls]) for cls in range(num_classes)}
+            metrics[agg] = {
+                'pred_counts': pred_counts,
+                'y_pred': y_pred,
+                'y_prob': y_prob,
+                'names': names,
+            }
+            continue
+        # Flatten to compute global metrics
+        y_true_flat = y_true.flatten()
+        y_pred_flat = y_pred.flatten()
+        # Compute classification metrics
+        f1_macro = float(f1_score(y_true_flat, y_pred_flat, average='macro'))
+        f1_micro = float(f1_score(y_true_flat, y_pred_flat, average='micro'))
+        acc      = float((y_true_flat == y_pred_flat).mean())
+        # Per label F1 and cross‑entropy loss
+        per_label_f1: Dict[str, float] = {}
+        per_label_loss: Dict[str, float] = {}
+        pred_counts: Dict[str, Dict[int, int]] = {}
+        # Compute negative log likelihood per label
+        epsilon = 1e-8
+        for i, col in enumerate(label_cols):
+            yt = y_true[:, i]
+            yp = y_pred[:, i]
+            # F1 macro per label
+            per_label_f1[col] = float(f1_score(yt, yp, average='macro'))
+            counts = np.bincount(yp, minlength=num_classes)
+            pred_counts[col] = {cls: int(counts[cls]) for cls in range(num_classes)}
+            # Cross entropy loss per label
+            # y_prob: (N_vol, L, C) aggregated probabilities
+            probs_label = y_prob[:, i, :]  # (N_vol, C)
+            # Convert true labels to one‑hot indices
+            # Compute negative log probability of the true class
+            # Add small epsilon to avoid log(0)
+            nll = -np.log(probs_label[np.arange(probs_label.shape[0]), yt] + epsilon)
+            per_label_loss[col] = float(np.mean(nll))
+        # Macro loss across labels
+        loss_macro = float(np.mean(list(per_label_loss.values())))
+        metrics[agg] = {
+            'f1_macro': f1_macro,
+            'f1_micro': f1_micro,
+            'acc': acc,
+            'per_label_f1': per_label_f1,
+            'per_label_loss': per_label_loss,
+            'loss_macro': loss_macro,
+            'pred_counts': pred_counts,
+            'y_pred': y_pred,
+            'y_prob': y_prob,
+            'y_true': y_true,
+            'names': names,
+        }
+    return metrics
+
+
+def epoch_subsample_frac_unique_patients(df, frac=0.1, seed=None):
+    """
+    Selecciona un subconjunto de pacientes (frac del total) y 
+    devuelve exactamente un registro aleatorio por cada paciente seleccionado.
+    """
     rng = np.random.default_rng(seed)
 
     # Lista de patient_id únicos y muestreo del frac
@@ -34,470 +423,625 @@ def epoch_subsample(df, frac=0.5, seed=None):
     # Filtrar DataFrame
     df_selected = df[df["patient_id"].isin(selected_patients)]
 
-    # Elegir un registro aleatorio por paciente
+    # Elegir un registro aleatorio por paciente (sin warning)
     df_sampled = (
-        df_selected.groupby("patient_id", group_keys=False)
-                   .sample(n=5, random_state=seed, replace=True)
-                  .reset_index(drop=True)
-                   #.apply(lambda g: g.sample(n=5, random_state=seed, replace=True))
-                   #.reset_index(drop=True)
+        df_selected.groupby("patient_id", group_keys=False, sort=False)
+                   .apply(lambda g: g.sample(n=5, random_state=seed, replace=True), include_groups=False)
+                   .reset_index(drop=True)
     )
+
     return df_sampled
-    """
-    return (
-        df.groupby("patient_id", group_keys=False)
-          .sample(frac=frac, random_state=seed)
-          .reset_index(drop=True)
-    )
-    """
+
+
+class DynamicFocalLoss2(nn.Module):
+    def __init__(self, alpha=(0.25, 0.75, 1.0), gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.register_buffer('alpha', alpha)
+        self.gamma = gamma
+        self.reduction = reduction
     
-def apply_label_smoothing(y, smoothing=0.05, num_classes=3):
-    """Convierte etiquetas one-hot a suavizadas."""
-    with torch.no_grad():
-        y_smooth = torch.full_like(y, smoothing / (num_classes - 1))
-        y_smooth.scatter_(1, y.argmax(dim=1, keepdim=True), 1.0 - smoothing)
-    return y_smooth
+    def forward(self, inputs, targets):
+        # inputs: (B,3), targets: (B,)
+        ce = F.cross_entropy(inputs, targets, reduction='none')
+        prob = F.softmax(inputs, dim=1)
+        p_t = prob[torch.arange(prob.size(0), device=prob.device), targets]
+        alpha_t = self.alpha[targets]               # <-- por clase
+        loss = alpha_t * (1 - p_t) ** self.gamma * ce
+        return loss.mean() if self.reduction == 'mean' else loss.sum()
 
-def cutmix_data(x, y, alpha=1.0):
-    """Aplicar CutMix."""
-    lam = np.random.beta(alpha, alpha)
-    rand_index = torch.randperm(x.size()[0]).to(x.device)
+import torch
 
-    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
-    x[:, :, bbx1:bbx2, bby1:bby2] = x[rand_index, :, bbx1:bbx2, bby1:bby2]
-
-    y_a, y_b = y, y[rand_index]
-    return x, y_a, y_b, lam
-
-def rand_bbox(size, lam):
-    """Generar caja aleatoria para CutMix."""
-    W = size[2]
-    H = size[3]
-    cut_rat = np.sqrt(1. - lam)
-    cut_w = int(W * cut_rat)
-    cut_h = int(H * cut_rat)
-
-    cx = np.random.randint(W)
-    cy = np.random.randint(H)
-
-    bbx1 = np.clip(cx - cut_w // 2, 0, W)
-    bby1 = np.clip(cy - cut_h // 2, 0, H)
-    bbx2 = np.clip(cx + cut_w // 2, 0, W)
-    bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-    return bbx1, bby1, bbx2, bby2
-
-
-class SlidingWindowAverage:
-    def __init__(self, window_size=10):
-        self.values = deque(maxlen=window_size)
-
-    def update(self, val):
-        self.values.append(val)
-
-    def get(self):
-        if not self.values:
-            return 0.0
-        return np.mean(self.values)
-
-    def is_full(self):
-        return len(self.values) == self.values.maxlen
-
-def inference_dataset(val_loader,model,args):
-    val_probs, val_trues, val_paths = [], [], []
-
-    with torch.no_grad():
-        for x, y, path, view in val_loader:
-            x = x.to(args.device)
-            view = view.to(args.device)
-            with torch.cuda.amp.autocast():
-                y_hat = model(x)
-            pred = torch.argmax(y_hat, dim=-1).cpu()
-            # 🧠 Guarda softmax por clase
-            batch_probs = torch.stack([torch.softmax(y_hat[:, i], dim=-1) for i in range(len(args.label_cols))], dim=1)
-            # shape (B, 7, 3)
-            val_probs.append(batch_probs.cpu())
-            val_trues.append(y.cpu())
-            val_paths.extend(path)
-
-    y_pred_val,y_prod_val,y_true_val,final_filenames = aggregate_predictions_by_img_path(val_probs,val_trues, val_paths)
-
-    return y_pred_val,y_prod_val, y_true_val,final_filenames
-
-from sklearn.metrics import f1_score, accuracy_score, precision_recall_fscore_support
-
-def get_metrics(df_train, val_oof_records, args, prefix=""):
-    val_df_oof = pd.DataFrame(val_oof_records)
-    print("GET metrics")
-    print(df_train.shape)
-    print(val_df_oof.shape)
-    val_df_oof = df_train[["filename", *args.label_cols]].merge(val_df_oof, on="filename", suffixes=("_true", "_pred"))
-
-    y_true = val_df_oof[[f"{l}_true" for l in args.label_cols]].values
-    y_pred = val_df_oof[[f"{l}_pred" for l in args.label_cols]].values
-
-    results = {}
-
-    # 🎯 Global
-    results[f"{prefix}f1_macro"] = f1_score(y_true.flatten(), y_pred.flatten(), average="macro",zero_division=0)
-    results[f"{prefix}f1_micro"] = f1_score(y_true.flatten(), y_pred.flatten(), average="micro",zero_division=0)
-    results[f"{prefix}acc"] = accuracy_score(y_true.flatten(), y_pred.flatten())
-
-    # 📊 Por etiqueta
-    for i, label in enumerate(args.label_cols):
-        yt = y_true[:, i]
-        yp = y_pred[:, i]
-
-        f1_macro = f1_score(yt, yp, average="macro",zero_division=0)
-        f1_micro = f1_score(yt, yp, average="micro",zero_division=0)
-        acc = accuracy_score(yt, yp)
-        _, _, f2, _ = precision_recall_fscore_support(yt, yp, average="macro", beta=2,zero_division=0)
-
-        results[f"{prefix}_{label}_f1_macro"] = f1_macro
-        results[f"{prefix}_{label}_f1_micro"] = f1_micro
-        results[f"{prefix}_{label}_f2"] = f2
-        results[f"{prefix}_{label}_acc"] = acc
-
-    return results
-
-import pandas as pd
-import numpy as np
-from collections import defaultdict
-
-def aggregate_predictions_by_img_path(val_probs,val_trues, val_paths):
+def _yolo_to_corners(box: torch.Tensor) -> torch.Tensor:
     """
-    Agrupa y promedia predicciones y etiquetas verdaderas por imagen base (ej. LISA_0001_LF_axi.nii.gz).
-    
-    Returns:
-        y_pred (np.ndarray): (N, 7) clases predichas por clase (argmax)
+    box: (..., 4) con (cx, cy, w, h) en [0,1]
+    return: (..., 4) con (x1, y1, x2, y2) en [0,1]
     """
-    probs_all = torch.cat(val_probs, dim=0).numpy()  # (N, 7, 3)
-    trues_all = torch.cat(val_trues, dim=0).numpy()  # (N, 7)
-    #/data/cristian/projects/med_data/rise-miccai/task-1-val/2d_images_all/train/LISA_0001_LF_axi_0.png
-    paths_all = ["_".join(p.split("/")[-1].split(".")[0].split("_")[:-1])+".nii.gz" for p in val_paths]
+    cx, cy, w, h = box.unbind(-1)
+    x1 = cx - w * 0.5
+    y1 = cy - h * 0.5
+    x2 = cx + w * 0.5
+    y2 = cy + h * 0.5
+    return torch.stack([x1, y1, x2, y2], dim=-1)
 
-    #print("paths_all:")
-    #print(paths_all)
-    #print()
-    # Diccionarios para acumulación
-    grouped_probs = defaultdict(list)
-    grouped_trues = defaultdict(list)
-    final_filenames = []
-    for path, probs, true in zip(paths_all, probs_all, trues_all):
-        grouped_probs[path].append(probs)  # (7, 3)
-        grouped_trues[path].append(true)   # (7,)
+def _box_area_xyxy(box_xyxy: torch.Tensor) -> torch.Tensor:
+    w = (box_xyxy[..., 2] - box_xyxy[..., 0]).clamp(min=0)
+    h = (box_xyxy[..., 3] - box_xyxy[..., 1]).clamp(min=0)
+    return w * h
 
-    final_prods, final_preds, final_trues = [], [], []
-    for key in grouped_probs:
-        mean_probs = np.mean(grouped_probs[key], axis=0)      # (7, 3)
-        pred = np.argmax(mean_probs, axis=1)                  # (7,)
-        final_preds.append(pred)
-        final_prods.append(mean_probs)
+@torch.no_grad()
+def iou_yolo(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    IoU entre cajas YOLO normalizadas.
+    box1, box2: tensores con shape (..., 4) en formato (cx, cy, w, h), valores en [0,1].
+                 Se permite broadcasting en las dimensiones iniciales.
+    return: IoU con shape broadcasted (...,)
 
-        mean_true = np.mean(grouped_trues[key], axis=0)       # (7,)
-        true = np.round(mean_true).astype(int)                # (7,)
-        final_trues.append(true)
-        final_filenames.append(key)
-    return np.stack(final_preds),np.stack(final_prods), np.stack(final_trues),final_filenames
+    Ej.: box1.shape = (B,4), box2.shape = (B,4)  -> IoU shape (B,)
+         box1.shape = (B,4), box2.shape = (1,4)  -> IoU shape (B,)
+    """
+    b1 = _yolo_to_corners(box1)
+    b2 = _yolo_to_corners(box2)
 
-import torch.nn.utils as nn_utils
+    # intersección
+    x1 = torch.max(b1[..., 0], b2[..., 0])
+    y1 = torch.max(b1[..., 1], b2[..., 1])
+    x2 = torch.min(b1[..., 2], b2[..., 2])
+    y2 = torch.min(b1[..., 3], b2[..., 3])
 
-def update_optimizer(model,optimizer, grad_scaler, clip_grad_max_norm,lr_scheduler):
-    """Performs gradient update with AMP, including gradient clipping."""
-    if grad_scaler:
-        grad_scaler.unscale_(optimizer)  # Unscale gradients before clipping
+    inter = _box_area_xyxy(torch.stack([x1, y1, x2, y2], dim=-1))
+    area1 = _box_area_xyxy(b1)
+    area2 = _box_area_xyxy(b2)
+    union = area1 + area2 - inter
+    return inter / (union + eps)
 
-    nn_utils.clip_grad_norm_(model.parameters(), clip_grad_max_norm)
+@torch.no_grad()
+def giou_yolo(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Generalized IoU para cajas en formato YOLO normalizado.
+    return: GIoU con shape broadcasted (...,)
+    """
+    b1 = _yolo_to_corners(box1)
+    b2 = _yolo_to_corners(box2)
 
-    if grad_scaler:
-        grad_scaler.step(optimizer)  # Step and automatically handle NaN/infs
-        grad_scaler.update()  # Update scaling factor
+    # IoU normal
+    x1 = torch.max(b1[..., 0], b2[..., 0])
+    y1 = torch.max(b1[..., 1], b2[..., 1])
+    x2 = torch.min(b1[..., 2], b2[..., 2])
+    y2 = torch.min(b1[..., 3], b2[..., 3])
+    inter = _box_area_xyxy(torch.stack([x1, y1, x2, y2], dim=-1))
+    area1 = _box_area_xyxy(b1)
+    area2 = _box_area_xyxy(b2)
+    union = area1 + area2 - inter
+    iou = inter / (union + eps)
+
+    # caja envolvente mínima
+    cx1 = torch.min(b1[..., 0], b2[..., 0])
+    cy1 = torch.min(b1[..., 1], b2[..., 1])
+    cx2 = torch.max(b1[..., 2], b2[..., 2])
+    cy2 = torch.max(b1[..., 3], b2[..., 3])
+    c_area = _box_area_xyxy(torch.stack([cx1, cy1, cx2, cy2], dim=-1))
+
+    giou = iou - (c_area - union) / (c_area + eps)
+    return giou
+
+
+def train_and_evaluate(train_df: pd.DataFrame,
+                       test_back_df: Optional[pd.DataFrame],
+                       label_cols: Iterable[str],
+                       args: Dict,
+                       aggregators: Iterable[str] = ('mean', 'vote', 'max', 'weighted')) -> Dict:
+    """Train models with cross‑validation and evaluate aggregators.
+
+    Parameters
+    ----------
+    train_df: DataFrame
+        Training data.  Must include columns for labels, ``patient_id``,
+        ``img_path``/``npy_path`` and ``path``/``filename``.
+    test_back_df: DataFrame or ``None``
+        Additional evaluation set with ground truth labels.  If provided,
+        aggregator metrics will be computed on this set as well.  This
+        corresponds to the ``df_test_back`` in the original code.
+    label_cols: iterable of str
+        Names of the label columns.
+    args: dict
+        Hyperparameters and options.  Expected keys include ``n_splits``,
+        ``batch_size``, ``epochs``, ``patience``, ``lr``, ``weight_decay``,
+        ``image_size``, ``in_channels``, ``base_model``, ``pretrained``,
+        ``head_type``, ``head_config``, ``use_view``, ``slice_frac``,
+        ``seed``, ``use_sampling``, ``device``, ``weight_method``,
+        ``weight_beta``, ``weight_alpha``, ``weight_cap``.
+    aggregators: iterable of str
+        Names of aggregation strategies to evaluate.
+
+    Returns
+    -------
+    results: dict
+        Contains overall cross‑validation metrics and per‑fold details,
+        along with aggregator results for validation and test back sets.
+    """
+    label_cols = list(label_cols)
+    n_splits = args.get('n_splits', 5)
+    device   = torch.device(args.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
+    # Assign folds
+    # If the training DataFrame already contains a 'fold' column, use it directly.
+    # Otherwise, decide how to split: by volume or by patient depending on args.
+    if 'fold' in train_df.columns:
+        df = train_df.copy()
+        # Ensure fold values are integers and within range [0, n_splits-1]
+        if not pd.api.types.is_integer_dtype(df['fold']):
+            df['fold'] = df['fold'].astype(int)
     else:
-        optimizer.step()
-    optimizer.zero_grad(set_to_none=True)  # Always reset gradients
-    if lr_scheduler:
-        lr_scheduler.step()
-
-
-def train_with_cv(df_train, df_test, label_cols, args,save_dir="./models_new/"):
-    os.makedirs(args.save_dir, exist_ok=True)
-    logging.basicConfig(filename=f"{args.save_dir}/training.log", level=logging.INFO)
-    weights_per_label = utils.compute_weights_from_df(df_train,args.label_cols,args.weight_method,
-    args.weight_beta,          # para "effective"
-    args.weight_alpha,          # para "invfreq"
-    args.weight_cap,            # para "invfreq"
-    args.device,
-    dtype=torch.float32)
-    
-    print("weights_per_label:",weights_per_label)
-    criterions = get_per_label_criterions(label_cols, weights_per_label, args)
-
-    val_oof_records  = []
-    test_preds_accum = []
-    fold_scores = []
-    log_values = {}
-    for fold in range(args.n_splits):
-        logging.info(f"🔁 Fold {fold}")
-        run = init_wandb(args,f"{args.experiment_name}:f{fold}")
-        log_values={}
-        
-        df_tr = df_train[df_train.fold != fold]
-        df_val = df_train[df_train.fold == fold]
-
-        ids_counts = df_tr["patient_id"].value_counts()
-        ids_train  = ids_counts.index.tolist()
-        df_common = df_val[df_val["patient_id"].isin(ids_train)].copy()
-        print(f"train  : {df_train.shape}")
-        print(f"df_tr  : {df_tr.shape}")
-        print(f"df_val : {df_val.shape}")
-        print(f"Train Test fold {fold} Casos comunes: {len(df_common)}")
-
-        #raise
-
-        for i, label in enumerate(label_cols):
-            y = df_tr[label].values
-            print(f"Train {label} true dist: {np.bincount(y, minlength=3)}")
-
-        for i, label in enumerate(label_cols):
-            y = df_val[label].values
-            print(f"Val {label} true dist: {np.bincount(y, minlength=3)}")
-
-        window_f1 = SlidingWindowAverage(window_size=5)
-        df_tr_full = df_tr.copy()
-
-        # Dataset
-        if args.type_modeling == "2d":
-            val_ds   = MRIDataset2D(df=df_val ,is_train=True,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
-            test_ds  = MRIDataset2D(df=df_test,is_train=True,use_augmentation=False,is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
+        split_by_volume = args.get('split_by_volume', False)
+        volume_id_col = args.get('volume_id', 'patient_id')
+        if split_by_volume:
+            # Use volume-level stratified splitting
+            df = assign_volume_stratified_folds(train_df, volume_id_col=volume_id_col,
+                                                label_cols=label_cols,
+                                                n_splits=n_splits,
+                                                top_k=args.top_k,
+                                                seed=args.get('seed', 42))
         else:
-            val_ds   = MRIDataset3D(df=df_val ,is_train=True,use_augmentation=False,labels=args.label_cols)
-            test_ds  = MRIDataset3D(df=df_test,is_train=True,use_augmentation=False,labels=args.label_cols)
-
-        val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, persistent_workers=True)
-        test_loader  = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, persistent_workers=True)
-
-
-        if args.type_modeling == "2d":
-            model = Model2DTimm(base_model=args.base_model,in_channels=args.in_channels,num_labels=len(args.label_cols),
-                                        num_classes=3,dropout_p=args.dropout_p).to(args.device)
+            # Default: stratify by patient using rare labels
+            df = assign_patient_stratified_folds(train_df, n_splits=n_splits, seed=args.get('seed', 42))
+    # Compute class weights per label
+    weights = compute_weights_from_df(
+        df, labels=label_cols,
+        method=args.get('weight_method', 'effective'),
+        beta=args.get('weight_beta', 0.99),
+        alpha=args.get('weight_alpha', 0.5),
+        cap=args.get('weight_cap', 8.0),
+        device=device,
+        dtype=torch.float32,
+    )
+    # Create loss functions per label (weighted CrossEntropy)
+    criterions: List[nn.Module] = []
+    for lbl in label_cols:
+        w = weights[lbl]
+        print(args.get('dynamic_w', "0.25, 0.75, 1.0"))
+        criterions.append(DynamicFocalLoss2(
+        alpha=torch.tensor([float(value) for value in args.get('dynamic_w', "0.25, 0.75, 1.0").split(",")], dtype=torch.float, device=device),
+        gamma=2.0)
+        )
+      #nn.CrossEntropyLoss(weight=w))
+        #criterions.append(DynamicFocalLoss(alpha=0.25, gamma=2.0)) #nn.CrossEntropyLoss(weight=w))
+    # Logging with WandB
+    # Determine if WandB logging is enabled via environment variables.  We will
+    # create a new WandB run for each fold rather than one global run.  This
+    # prevents mixing of step counters across folds.
+    use_wandb = bool(os.getenv('WANDB_API_KEY')) and bool(os.getenv('PROJECT_WANDB'))
+    # A WandB run will be initialised within each fold if enabled
+    run = None
+    # Store metrics
+    fold_results = []
+    # Paths to save models
+    out_dir = args.get('save_dir', './models')
+    os.makedirs(out_dir, exist_ok=True)
+    # Loop over folds
+    for fold in range(n_splits):
+        # Split data
+        train_fold = df[df['fold'] != fold].reset_index(drop=True)
+        val_fold   = df[df['fold'] == fold].reset_index(drop=True)
+        # Determine normalisation mode and compute per-view stats for this fold if needed
+        norm_mode = args.get('norm_mode', 'slice_z')
+        per_view_stats = None
+        if norm_mode == 'dataset_z_per_view':
+            print("Compute dataset_z_per_view")
+            per_view_stats = compute_stats_per_view(train_fold)
+            # Save stats to disk for inference
+            stats_file = os.path.join(out_dir, f"per_view_stats_fold{fold}.json")
+            with open(stats_file, 'w') as f:
+                json.dump(per_view_stats, f)
+        # Create datasets with explicit normalisation
+        train_ds = MRIDataset2D(train_fold, is_train=True, use_augmentation=True,
+                                is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224),
+                                norm_mode=norm_mode, per_view_stats=per_view_stats)
+        val_ds   = MRIDataset2D(val_fold,   is_train=True, use_augmentation=False,
+                                is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224),
+                                norm_mode=norm_mode, per_view_stats=per_view_stats)
+        # DataLoaders
+        if args.get('use_sampling', True):
+            sample_weights = compute_sample_weights(train_fold, label_cols)
+            sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+            train_loader = DataLoader(train_ds, batch_size=args.get('batch_size', 16), sampler=sampler,
+                                      num_workers=args.get('num_workers', 4), pin_memory=True)
         else:
-            model = Model3DResnet(num_labels=len(args.label_cols), num_classes=3,dropout_p=args.dropout_p,
-                                        pretrained=True, freeze_backbone=False).to(args.device) 
-
+            train_loader = DataLoader(train_ds, batch_size=args.get('batch_size', 16), shuffle=True,
+                                      num_workers=args.get('num_workers', 4), pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=args.get('batch_size', 16), shuffle=False,
+                                num_workers=args.get('num_workers', 4), pin_memory=True)
+        # Instantiate model
+        model = Model2DTimm(
+            base_model=args.get('base_model', 'maxvit_tiny_tf_512.in1k'),
+            in_channels=args.get('in_channels', 1),
+            num_labels=len(label_cols),
+            num_classes=3,
+            pretrained=args.get('pretrained', True),
+            head_type=args.get('head_type', 'label_tokens'),
+            head_config=args.get('head_config', {}),
+            use_view=args.get('use_view', False),
+        ).to(device)
+        #optimizer = torch.optim.Adam(model.parameters(), lr=args.get('lr', 1e-4), weight_decay=args.get('weight_decay', 1e-4))
+        optimizer = torch.optim.Adam([
+            {"params": model.backbone.parameters(),"lr":args.get('lr', 1e-4)},
+            {"params": model.view_emb.parameters(),"lr":args.get('lr', 1e-4)},
+            {"params": model.head.parameters(),    "lr":args.get('lr', 1e-4)},
+            {"params": model.reg_head.parameters(),"lr":5*args.get('lr', 1e-4)}],
+            weight_decay=args.get('weight_decay', 1e-4)
+        )
         grad_scaler = torch.cuda.amp.GradScaler(enabled=True)
-        optimizer = torch.optim.Adam(model.parameters(), lr= args.lr, weight_decay=args.weight_decay)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.95, patience=5)
+        scheduler   = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.95, patience=args.get('scheduler_patience', 5)
+        )
+        # Initialise a WandB run for this fold if logging is enabled
+        if use_wandb:
+            import wandb
+            exp_name = args.get('experiment_name', 'lisa_experiment')
+            run = wandb.init(
+                project=os.getenv('PROJECT_WANDB'),
+                entity=os.getenv('ENTITY'),
+                name=f"{exp_name}_fold{fold}",
+                group=exp_name,
+                config=args,
+                reinit=True,
+            )
+        # Training loop
+        best_f1 = 0.0
+        patience_counter = args.get('patience', 5)
+        best_state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        for epoch in range(args.get('epochs', 30)):
+            # Optional slice fraction for each epoch
+            if args.get('slice_frac', 1.0) < 1.0:
+                frac = args['slice_frac']
+                """
+                train_fold_ep = (
+                    train_fold.groupby('patient_id', group_keys=False)
+                        .sample(frac=frac, random_state=epoch)
+                        .reset_index(drop=True)
+                )"""
+                train_fold_ep = epoch_subsample_frac_unique_patients(train_fold, frac=0.1, seed=None)
 
-
-        val_best_f1 = 0
-        patience = args.patience
-        step = 0
-        for epoch in range(args.epochs):
-
-            df_tr = epoch_subsample(df_tr_full, frac=args.slice_frac, seed=epoch)
-            print(f"df_tr recortado: {df_tr.shape}")
-
-            #for i, label in enumerate(label_cols):
-            #    y = df_tr[label].values
-            #    print(f"epoch {epoch} Train {label} true dist: {np.bincount(y, minlength=3)}")
-
-
-            # Dataset
-            if args.type_modeling == "2d":
-                train_ds = MRIDataset2D(df=df_tr  ,is_train=True,use_augmentation=True, is_numpy=bool(args.is_numpy),labels=args.label_cols,image_size=args.image_size)
-            else:
-                train_ds = MRIDataset3D(df=df_tr  ,is_train=True,use_augmentation=True,labels=args.label_cols)
-            #"""
-            # Sampler sin alterar distribución del dataset
-            if bool(args.use_sampling):
-                print("USING use_sampling")
-                weights = utils.compute_sample_weights(df_tr, label_cols)
-                sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
-                train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers)
-            else:
-                print("NO use_sampling")
-                train_loader = DataLoader(train_ds, batch_size=args.batch_size,  shuffle=True, num_workers=args.num_workers, persistent_workers=True)
-
-            loss_log_values = {}
-            for i, label in enumerate(label_cols):
-                loss_log_values[f"val_{label}_loss"] = 0
-
+                train_ds_ep = MRIDataset2D(train_fold_ep, is_train=True, use_augmentation=True,
+                                           is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224),
+                                           norm_mode=norm_mode, per_view_stats=per_view_stats)
+                if args.get('use_sampling', True):
+                    sample_weights = compute_sample_weights(train_fold_ep, label_cols)
+                    sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+                    train_loader = DataLoader(train_ds_ep, batch_size=args.get('batch_size', 16), sampler=sampler,
+                                              num_workers=args.get('num_workers', 4), pin_memory=True)
+                else:
+                    train_loader = DataLoader(train_ds_ep, batch_size=args.get('batch_size', 16), shuffle=True,
+                                              num_workers=args.get('num_workers', 4), pin_memory=True)
+            # Train one epoch
             model.train()
-            total_loss = 0
-            for x, y, path, view in tqdm(train_loader, desc=f"Train Fold {fold} Epoch {epoch}"):
-                x, y = x.to(args.device), y.to(args.device)
-                view = view.to(args.device)
+            running_loss = 0.0
+            nbatches = 0
+            pbar = tqdm(train_loader, desc=f"Fold {fold} Epoch {epoch}", leave=False, dynamic_ncols=True)
+            for step, (x, y, _, view,aux_target) in enumerate(pbar, start=1):
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                view = view.to(device, non_blocking=True)
+                aux_target = aux_target.to(device, non_blocking=True)  # (B,3) en [0,1]
+
+                optimizer.zero_grad(set_to_none=True)
                 with torch.cuda.amp.autocast():
+                    y_hat,aux_pred  = model(x, view) if args.get('use_view', False) else model(x)
+                    cls_loss = sum(criterions[i](y_hat[:, i], y[:, i]) for i in range(len(label_cols))) / len(label_cols)
+                    
+                    #aux_loss = F.smooth_l1_loss(aux_pred, aux_target)
+                    #loss = cls_loss + args.get("lambda_aux", 0.2) * aux_loss
+                    aux_l1  = torch.nn.functional.smooth_l1_loss(aux_pred, aux_target)
+                    aux_giou = (1.0 - giou_yolo(aux_pred, aux_target)).mean()
+                    aux_loss = 0.5 * aux_l1 + 0.5 * aux_giou
+                    loss = cls_loss + args.get("lambda_aux", 0.5) * aux_loss   # súbelo a 0.3–1.0 para probar
 
-                    # Alternancia Mixup / CutMix
-                    r = random.random()
-                    if r < args.mixup_prob:
-                        x, view, y_a, y_b, lam = mixup_data(x, view, y, alpha=args.mixup_alpha)
-                        y_hat = model(x)
-                        loss = sum(lam * criterions[i](y_hat[:, i], y_a[:, i]) +
-                                   (1 - lam) * criterions[i](y_hat[:, i], y_b[:, i])
-                                   for i in range(len(label_cols))) / len(label_cols)
-                    elif r < args.mixup_prob + args.cutmix_prob:
-                        x, y_a, y_b, lam = cutmix_data(x, y, alpha=args.cutmix_alpha)
-                        y_hat = model(x)
-                        loss = sum(lam * criterions[i](y_hat[:, i], y_a[:, i]) +
-                                   (1 - lam) * criterions[i](y_hat[:, i], y_b[:, i])
-                                   for i in range(len(label_cols))) / len(label_cols)
-                    else:
-                        y_hat = model(x)
-                        loss = sum(criterions[i](y_hat[:, i], y[:, i]) for i in range(len(label_cols))) / len(label_cols)
-
-
-                    #optimizer.zero_grad()
-                    #loss.backward()
-                    grad_scaler.scale(loss).backward()
-                    update_optimizer(model,optimizer, grad_scaler, 0.5,None)
-                    #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                    #optimizer.step()
-                    total_loss += loss.item()
-
-            # Validation
+                grad_scaler.scale(loss).backward()
+                # Update optimizer
+                grad_scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+                running_loss += float(loss.item())
+                nbatches += 1
+                # Do not log per batch.  Logging happens at the end of the epoch with a global step.
+            epoch_loss = running_loss / max(1, nbatches)
+            # ------- Validation at epoch end -------
+            # 1) Compute slice‑level validation loss to compare with training loss.
             model.eval()
-            val_preds, val_trues = [], []
-            val_probs, val_trues, val_paths = [], [], []
-            val_total_loss = 0
+            val_loss_total = 0.0
+            n_val_batches = 0
             with torch.no_grad():
-                for x, y, path, view in tqdm(val_loader, desc=f"Val Fold {fold} Epoch {epoch}"):
-                    x, y = x.to(args.device), y.to(args.device)
-                    view = view.to(args.device)
+                for x_val, y_val, _, view_val,aux_target_val in val_loader:
+                    x_val   = x_val.to(device, non_blocking=True)
+                    y_val   = y_val.to(device, non_blocking=True)
+                    view_val= view_val.to(device, non_blocking=True)
+                    aux_target_val = aux_target_val.to(device, non_blocking=True)  # (B,3) en [0,1]
                     with torch.cuda.amp.autocast():
-                        y_hat = model(x)
-                        loss = sum(criterions[i](y_hat[:, i], y[:, i]) for i in range(len(label_cols))) / len(label_cols)
-                        pred = torch.argmax(y_hat, dim=-1).cpu()
-                        # 🧠 Guarda softmax por clase
-                        batch_probs = torch.stack([torch.softmax(y_hat[:, i], dim=-1) for i in range(len(label_cols))], dim=1)
-                        # shape (B, 7, 3)
-                        val_probs.append(batch_probs.cpu())
-                        val_trues.append(y.cpu())
-                        val_paths.extend(path)
-                        val_preds.append(pred)
-                        val_total_loss+=loss.item()
+                        y_hat_val,aux_pred_val = model(x_val, view_val) if args.get('use_view', False) else model(x_val)
+                        cls_loss_val = sum(
+                            criterions[i](y_hat_val[:, i], y_val[:, i]) for i in range(len(label_cols))
+                        ) / len(label_cols)
+                        #aux_loss_val = F.smooth_l1_loss(aux_pred_val, aux_target_val)
+                        #loss_val = cls_loss_val + args.get("lambda_aux", 0.2) * aux_loss_val
 
-                        # 🎯 Diagnóstico de pérdida por etiqueta
-                        losses_by_label = [
-                            criterions[i](y_hat[:, i], y[:, i]).item()
-                            for i in range(len(label_cols))
-                        ]
-
-                        for i, label in enumerate(label_cols):
-                            loss_log_values[f"val_{label}_loss"] += losses_by_label[i]
-
-                        for i, label in enumerate(label_cols):
-                            probs = torch.softmax(y_hat[:, i], dim=-1).detach().cpu().numpy()
-                            entropies = scipy.stats.entropy(probs.T)  # (B,)
-                            #print(f"{label} entropy mean: {np.mean(entropies):.4f} ± {np.std(entropies):.4f}")
+                        aux_l1_val  = torch.nn.functional.smooth_l1_loss(aux_pred_val, aux_target_val)
+                        aux_giou_val = (1.0 - giou_yolo(aux_pred_val, aux_target_val)).mean()
+                        aux_loss_val = 0.5 * aux_l1_val + 0.5 * aux_giou_val
+                        loss_val = cls_loss_val + args.get("lambda_aux", 0.5) * aux_loss_val   # súbelo a 0.3–1.0 para probar
 
 
-            #y_pred_val = torch.cat(val_preds).cpu().numpy()
-            #y_true_val = torch.cat(val_trues).cpu().numpy()
-            y_pred_val,y_prod_val,y_true_val,final_filenames = aggregate_predictions_by_img_path(val_probs,val_trues, val_paths)
-
-            for i, label in enumerate(label_cols):
-                y_true = y_true_val[:, i]
-                y_pred = y_pred_val[:, i]
-                if label == "Banding":
-                    print(f"\n🔎 {label} - Preds:", np.bincount(y_pred, minlength=3), "| Truth:", np.bincount(y_true, minlength=3))
-
-            val_f1 = f1_score(y_true_val.flatten(), y_pred_val.flatten(), average="macro")
-
+                    val_loss_total += float(loss_val.item())
+                    n_val_batches += 1
+            val_loss_slice_level = val_loss_total / max(1, n_val_batches)
+            # 2) Collect per‑slice predictions on val set for aggregator evaluation
+            val_results = collect_slice_predictions(val_loader, model, device)
+            val_metrics = evaluate_aggregators(val_results, label_cols, num_classes=3, aggregators=aggregators)
+            # 3) Choose mean aggregator to compute scheduler metric
+            val_f1 = val_metrics['mean']['f1_macro'] if 'mean' in val_metrics and 'f1_macro' in val_metrics['mean'] else 0.0
             scheduler.step(val_f1)
-            val_acc = accuracy_score(y_true_val.flatten(), y_pred_val.flatten())
-            window_f1.update(val_f1)
-            val_f1_mean = window_f1.get()
-            train_loss = total_loss / len(train_loader)
-            val_loss   = val_total_loss/ len(val_loader)
-
-            print(f"📈 Epoch {epoch} | Train loss: {train_loss:.4f} | Val loss : {val_loss:.4f}| F1: {val_f1:.4f} | Acc: {val_acc:.4f} | F1_mean: {val_f1_mean:.4f} | BestF1: {val_best_f1:4f}")
-
-
-            if val_f1_mean > val_best_f1:
-                val_best_f1 = val_f1_mean
-                torch.save(model.state_dict(), f"{save_dir}/model_fold{fold}.pt")
-                patience = args.patience
+            # ------- Logging per epoch -------
+            # Print a summary of validation metrics for each aggregator to the console
+            print(f"Fold {fold} Epoch {epoch} (train_loss={epoch_loss:.4f}, val_loss={val_loss_slice_level:.4f}):", end=" ")
+            summary_strs = []
+            for agg_name, m in val_metrics.items():
+                if 'f1_macro' in m:
+                    summary_strs.append(f"{agg_name}: F1_macro={m['f1_macro']:.4f}, acc={m['acc']:.4f}")
+            print(" | ".join(summary_strs))
+            # Accumulate metrics into a dictionary and log once per epoch using local step
+            if use_wandb and run is not None:
+                step_epoch = epoch  # local step for this fold's run
+                log_data: Dict[str, float | int] = {
+                    'epoch': epoch,
+                    'train/loss': epoch_loss,
+                    'val/loss': val_loss_slice_level,
+                }
+                for agg_name, m in val_metrics.items():
+                    if 'f1_macro' in m:
+                        log_data[f'val_global/val_{agg_name}_f1_macro'] = m['f1_macro']
+                        log_data[f'val_global/val_{agg_name}_f1_micro'] = m['f1_micro']
+                        log_data[f'val_global/val_{agg_name}_acc'] = m['acc']
+                        log_data[f'val_global/val_{agg_name}_loss_macro'] = m.get('loss_macro', 0.0)
+                        for lbl in label_cols:
+                            log_data[f'val_{agg_name}_f1/{lbl}'] = m['per_label_f1'].get(lbl, 0.0)
+                            log_data[f'val_{agg_name}_loss/{lbl}'] = m['per_label_loss'].get(lbl, 0.0)
+                            for cls in range(3):
+                                cnt = m['pred_counts'][lbl].get(cls, 0)
+                                log_data[f'val_{agg_name}_counts/{lbl}_{cls}'] = cnt
+                run.log(log_data, step=step_epoch)
+            # Track best model based on mean aggregator F1
+            if val_f1 > best_f1:
+                best_f1 = val_f1
+                patience_counter = args.get('patience', 5)
+                best_state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
             else:
-                patience -= 1
-                if patience == 0:
-                    print("⏹️ Early stopping")
+                patience_counter -= 1
+                if patience_counter == 0:
+                    # Early stopping
                     break
-            for i, label in enumerate(label_cols):
-                loss_log_values[f"val_{label}_loss"] /= len(val_loader)
-    
-            log_values={}
-            log_values[f"epoch"] = epoch
-            log_values[f"train_loss"] = train_loss
-            log_values[f"val_loss"] = val_loss
-            log_values[f"val_f1_macro"] = val_f1
-            log_values[f"val_acc"] = val_acc
-            log_values[f"val_f1_macro_mean"] = val_f1_mean
-            log_values[f"val_best_f1"] = val_best_f1
-            log_values.update(loss_log_values)
+        # Save best model for fold
+        model.load_state_dict(best_state_dict)
+        model_path = os.path.join(out_dir, f"model_fold{fold}.pt")
+        torch.save(best_state_dict, model_path)
+        # Evaluate aggregators on val set again using best model
+        best_val_results = collect_slice_predictions(val_loader, model, device)
+        best_val_metrics = evaluate_aggregators(best_val_results, label_cols, num_classes=3, aggregators=aggregators)
+        # Evaluate aggregators on test_back if provided
+        test_back_metrics = None
+        if test_back_df is not None and not test_back_df.empty:
+            test_back_ds = MRIDataset2D(test_back_df, is_train=True, use_augmentation=False,
+                                       is_numpy=True, labels=label_cols, image_size=args.get('image_size', 224),
+                                       norm_mode=norm_mode, per_view_stats=per_view_stats)
+            test_back_loader = DataLoader(test_back_ds, batch_size=args.get('batch_size', 16), shuffle=False,
+                                          num_workers=args.get('num_workers', 4), pin_memory=True)
+            test_back_results = collect_slice_predictions(test_back_loader, model, device)
+            test_back_metrics = evaluate_aggregators(test_back_results, label_cols, num_classes=3, aggregators=aggregators)
+        # Print final validation metrics and optional test_back metrics for this fold
+        print(f"Fold {fold} final validation metrics:")
+        for agg_name, m in best_val_metrics.items():
+            if 'f1_macro' in m:
+                print(f"  {agg_name}: F1_macro={m['f1_macro']:.4f}, acc={m['acc']:.4f}")
+        if test_back_metrics:
+            print(f"Fold {fold} test_back metrics:")
+            for agg_name, m in test_back_metrics.items():
+                if 'f1_macro' in m:
+                    print(f"  {agg_name}: F1_macro={m['f1_macro']:.4f}, acc={m['acc']:.4f}")
+        # Log aggregator metrics for fold and close this fold's WandB run
+        fold_results.append({
+            'fold': fold,
+            'best_f1': best_f1,
+            'val_metrics': best_val_metrics,
+            'test_back_metrics': test_back_metrics,
+        })
 
-            # 📊 Métricas por etiqueta
-            for i, label in enumerate(label_cols):
-                yt = y_true_val[:, i]
-                yp = y_pred_val[:, i]
-                f1 = f1_score(yt, yp, average="macro",zero_division=0)
-                f1_micro = f1_score(yt, yp, average="micro",zero_division=0)
-                acc = accuracy_score(yt, yp)
-                _, _, f2, _ = precision_recall_fscore_support(yt, yp, average="macro", beta=2,zero_division=0)
-                log_values[f"val_{label}_f1_macro"] = f1
-                log_values[f"val_{label}_f1_micro"] = f1_micro
-                log_values[f"val_{label}_f2_macro"] = f2
-                log_values[f"val_{label}_acc"]      = acc
+        # ----- Save per-aggregator predictions and probabilities -----
+        # For each aggregator, if predictions and probabilities are available,
+        # write them to CSV files for further analysis.  We save one file per
+        # aggregator and dataset (val, test_back) per fold.  Each row contains
+        # the filename, the predicted class per label, and the probability of
+        # each class per label.
+        def _save_preds(metrics: Dict[str, Dict], dataset_name: str) -> None:
+            for agg_name, m in metrics.items():
+                # y_prob and y_pred are only present when y_true is available (val/test_back)
+                if 'y_prob' in m and 'y_pred' in m and 'names' in m:
+                    y_pred_arr = m['y_pred']  # shape (N, L)
+                    y_prob_arr = m['y_prob']  # shape (N, L, C)
+                    names_list = m['names']
+                    # Construct DataFrame
+                    df_pred = pd.DataFrame({'filename': names_list})
+                    for i, lbl in enumerate(label_cols):
+                        df_pred[lbl] = y_pred_arr[:, i]
+                        for cls_idx in range(y_prob_arr.shape[-1]):
+                            df_pred[f'{lbl}_{cls_idx}'] = y_prob_arr[:, i, cls_idx]
+                    # Ensure directory exists
+                    agg_dir = os.path.join(out_dir, f'preds_fold{fold}')
+                    os.makedirs(agg_dir, exist_ok=True)
+                    # File path
+                    file_name = f'{dataset_name}_{agg_name}_fold{fold}_probs.csv'
+                    file_path = os.path.join(agg_dir, file_name)
+                    df_pred.to_csv(file_path, index=False)
+                    print(f"Saved {dataset_name} predictions for aggregator '{agg_name}' to {file_path}")
 
-            wandb.log(log_values, step=step)
-            step+=1
+                    file_name = f'{dataset_name}_{agg_name}_fold{fold}_preds.csv'
+                    file_path = os.path.join(agg_dir, file_name)
+                    df_pred[["filename"]+label_cols].to_csv(file_path, index=False)
+                    print(f"Saved {dataset_name} predictions for aggregator '{agg_name}' to {file_path}")
 
-        # ✅ OOF pred con el mejor modelo
-        fold_scores.append({"fold": fold, "val_f1": val_best_f1})
-
-        print(f"🔁 Loading best model for fold {fold}")
-        model.load_state_dict(torch.load(f"{save_dir}/model_fold{fold}.pt"))
-        model.eval()
-
-        y_pred_val,y_prod_val,y_true_val,val_files   = inference_dataset(val_loader,model,args)
-        for yp, yt, f in zip(y_pred_val, y_true_val, val_files):
-            val_oof_records.append({**{l: yp[i] for i, l in enumerate(args.label_cols)}, "filename": f})
-
-        test_oof_records = []
-        y_pred_test,y_prod_val,y_true_test,test_files = inference_dataset(test_loader,model,args)
-        for yp, yt, f in zip(y_pred_test, y_true_test, test_files):
-            test_oof_records.append({**{l: yp[i] for i, l in enumerate(args.label_cols)}, "filename": f})
-        test_results = get_metrics(df_test,test_oof_records,args,prefix="test_oof_")
-        log_values.update(test_results)
-        wandb.log(log_values, step=step)
-
-        if fold < (args.n_splits-1):
-            wandb.finish()
-
-    val_results  = get_metrics(df_train,val_oof_records,args,prefix="val_oof_")
-    test_results = get_metrics(df_test,test_oof_records,args,prefix="test_oof_")
-
-
-    # 🎯 Global CV F1 Macro    
-    for val_key,test_key in zip(val_results.keys(),test_results.keys()):
-        print(f"🎯 Global CV {val_key}: {val_results[val_key]:.4f} | CV {test_key}: {test_results[test_key]:.4f}")
-    
-    final_results = {
-        "fold_scores": fold_scores,
-        "oof_path": f"{save_dir}/oof_predictions.csv",
-        "step":step
+        # Save validation predictions
+        _save_preds(best_val_metrics, 'val')
+        # Save test_back predictions
+        if test_back_metrics:
+            _save_preds(test_back_metrics, 'test_back')
+        if use_wandb and run is not None:
+            # Prepare summary metrics for this fold (best F1 and optional test_back)
+            summary_data: Dict[str, float | int] = {
+                'best_f1': best_f1,
+            }
+            if test_back_metrics:
+                for agg_name, m in test_back_metrics.items():
+                    if 'f1_macro' in m:
+                        summary_data[f'test_back_global/test_back_{agg_name}_f1_macro'] = m['f1_macro']
+                        summary_data[f'test_back_global/test_back_{agg_name}_f1_micro'] = m['f1_micro']
+                        summary_data[f'test_back_global/test_back_{agg_name}_acc'] = m['acc']
+                        summary_data[f'test_back_global/test_back_{agg_name}_loss_macro'] = m.get('loss_macro', 0.0)
+                        for lbl in label_cols:
+                            summary_data[f'test_back_{agg_name}_f1/{lbl}'] = m['per_label_f1'][lbl]
+                            summary_data[f'test_back_{agg_name}_loss/{lbl}'] = m['per_label_loss'][lbl]
+                            for cls in range(3):
+                                cnt = m['pred_counts'][lbl].get(cls, 0)
+                                summary_data[f'test_back_{agg_name}_counts/{lbl}_{cls}'] = cnt
+            # Log at the final epoch step for this fold's run
+            step_summary = args.get('epochs', 30)
+            run.log(summary_data, step=step_summary)
+            # Finish this fold's WandB run
+            run.finish()
+    # Ensemble across folds on validation and test_back sets
+    # For each aggregator, average probabilities across folds and recompute predictions
+    ensemble_results = {}
+    if n_splits > 1:
+        # Collect per fold predictions for val and test_back
+        val_preds_by_fold = {agg: [] for agg in aggregators}
+        test_preds_by_fold = {agg: [] for agg in aggregators}
+        val_names = None
+        test_names = None
+        for fr in fold_results:
+            # Validation
+            for agg in aggregators:
+                m = fr['val_metrics'][agg]
+                val_preds_by_fold[agg].append(m['y_prob'])  # (N, L, C)
+                val_names = m['names']
+            # Test back
+            if test_back_df is not None and fr['test_back_metrics']:
+                for agg in aggregators:
+                    m = fr['test_back_metrics'][agg]
+                    test_preds_by_fold[agg].append(m['y_prob'])
+                    test_names = m['names']
+        # Compute ensemble metrics by aggregating metrics across folds rather than stacking
+        val_ensemble_metrics: Dict[str, Dict] = {}
+        test_ensemble_metrics: Dict[str, Dict] = {}
+        for agg in aggregators:
+            # Validation ensemble: average metrics across folds
+            metrics_list = [fr['val_metrics'][agg] for fr in fold_results if agg in fr['val_metrics']]
+            if metrics_list:
+                f1_macro_avg = float(np.mean([m['f1_macro'] for m in metrics_list]))
+                f1_micro_avg = float(np.mean([m['f1_micro'] for m in metrics_list]))
+                acc_avg      = float(np.mean([m['acc'] for m in metrics_list]))
+                per_label_f1_avg: Dict[str, float] = {}
+                per_label_loss_avg: Dict[str, float] = {}
+                pred_counts_sum: Dict[str, Dict[int, int]] = {lbl: {0:0,1:0,2:0} for lbl in label_cols}
+                for lbl in label_cols:
+                    per_label_f1_avg[lbl] = float(np.mean([m['per_label_f1'][lbl] for m in metrics_list]))
+                    per_label_loss_avg[lbl] = float(np.mean([m['per_label_loss'][lbl] for m in metrics_list]))
+                    # Sum counts across folds
+                    for m in metrics_list:
+                        for cls in range(3):
+                            pred_counts_sum[lbl][cls] += m['pred_counts'][lbl].get(cls, 0)
+                loss_macro_avg = float(np.mean(list(per_label_loss_avg.values())))
+                val_ensemble_metrics[agg] = {
+                    'f1_macro': f1_macro_avg,
+                    'f1_micro': f1_micro_avg,
+                    'acc': acc_avg,
+                    'per_label_f1': per_label_f1_avg,
+                    'per_label_loss': per_label_loss_avg,
+                    'loss_macro': loss_macro_avg,
+                    'pred_counts': pred_counts_sum,
+                }
+            # Test_back ensemble: average metrics across folds
+            if test_back_df is not None:
+                metrics_test_list = []
+                for fr in fold_results:
+                    if fr['test_back_metrics'] and agg in fr['test_back_metrics']:
+                        metrics_test_list.append(fr['test_back_metrics'][agg])
+                if metrics_test_list:
+                    f1_macro_avg = float(np.mean([m['f1_macro'] for m in metrics_test_list]))
+                    f1_micro_avg = float(np.mean([m['f1_micro'] for m in metrics_test_list]))
+                    acc_avg      = float(np.mean([m['acc'] for m in metrics_test_list]))
+                    per_label_f1_avg: Dict[str, float] = {}
+                    per_label_loss_avg: Dict[str, float] = {}
+                    pred_counts_sum: Dict[str, Dict[int, int]] = {lbl: {0:0,1:0,2:0} for lbl in label_cols}
+                    for lbl in label_cols:
+                        per_label_f1_avg[lbl] = float(np.mean([m['per_label_f1'][lbl] for m in metrics_test_list]))
+                        per_label_loss_avg[lbl] = float(np.mean([m['per_label_loss'][lbl] for m in metrics_test_list]))
+                        for m in metrics_test_list:
+                            for cls in range(3):
+                                pred_counts_sum[lbl][cls] += m['pred_counts'][lbl].get(cls, 0)
+                    loss_macro_avg = float(np.mean(list(per_label_loss_avg.values())))
+                    test_ensemble_metrics[agg] = {
+                        'f1_macro': f1_macro_avg,
+                        'f1_micro': f1_micro_avg,
+                        'acc': acc_avg,
+                        'per_label_f1': per_label_f1_avg,
+                        'per_label_loss': per_label_loss_avg,
+                        'loss_macro': loss_macro_avg,
+                        'pred_counts': pred_counts_sum,
+                    }
+        ensemble_results['val'] = val_ensemble_metrics
+        ensemble_results['test_back'] = test_ensemble_metrics
+        # Print ensemble metrics to the console
+        if val_ensemble_metrics:
+            print("Ensemble validation results:")
+            for agg_name, m in val_ensemble_metrics.items():
+                print(f"  {agg_name}: F1_macro={m['f1_macro']:.4f}, acc={m['acc']:.4f}")
+        if test_ensemble_metrics:
+            print("Ensemble test_back results:")
+            for agg_name, m in test_ensemble_metrics.items():
+                print(f"  {agg_name}: F1_macro={m['f1_macro']:.4f}, acc={m['acc']:.4f}")
+        # If WandB is enabled, log ensemble metrics in a separate run
+        if use_wandb and (val_ensemble_metrics or test_ensemble_metrics):
+            import wandb
+            exp_name = args.get('experiment_name', 'lisa_experiment')
+            en_run = wandb.init(
+                project=os.getenv('PROJECT_WANDB'),
+                entity=os.getenv('ENTITY'),
+                name=f"{exp_name}_ensemble",
+                group=exp_name,
+                config=args,
+                reinit=True,
+            )
+            log_data: Dict[str, float | int] = {}
+            for agg_name, m in val_ensemble_metrics.items():
+                log_data[f'ensemble_val_{agg_name}_f1_macro'] = m['f1_macro']
+                log_data[f'ensemble_val_{agg_name}_f1_micro'] = m['f1_micro']
+                log_data[f'ensemble_val_{agg_name}_acc'] = m['acc']
+                log_data[f'ensemble_val_{agg_name}_loss_macro'] = m.get('loss_macro', 0.0)
+                for lbl in label_cols:
+                    log_data[f'ensemble_val_{agg_name}_f1/{lbl}'] = m['per_label_f1'][lbl]
+                    log_data[f'ensemble_val_{agg_name}_loss/{lbl}'] = m['per_label_loss'][lbl]
+                    for cls in range(3):
+                        log_data[f'ensemble_val_{agg_name}_counts/{lbl}_{cls}'] = m['pred_counts'][lbl][cls]
+            for agg_name, m in test_ensemble_metrics.items():
+                log_data[f'ensemble_test_back_global/ensemble_test_back_{agg_name}_f1_macro'] = m['f1_macro']
+                log_data[f'ensemble_test_back_global/ensemble_test_back_{agg_name}_f1_micro'] = m['f1_micro']
+                log_data[f'ensemble_test_back_global/ensemble_test_back_{agg_name}_acc'] = m['acc']
+                log_data[f'ensemble_test_back_global/ensemble_test_back_{agg_name}_loss_macro'] = m.get('loss_macro', 0.0)
+                for lbl in label_cols:
+                    log_data[f'ensemble_test_back_{agg_name}_f1/{lbl}'] = m['per_label_f1'][lbl]
+                    log_data[f'ensemble_test_back_{agg_name}_loss/{lbl}'] = m['per_label_loss'][lbl]
+                    for cls in range(3):
+                        log_data[f'ensemble_test_back_{agg_name}_counts/{lbl}_{cls}'] = m['pred_counts'][lbl][cls]
+            # Log at step 0 for the ensemble run
+            en_run.log(log_data, step=0)
+            en_run.finish()
+    # Return results
+    return {
+        'fold_results': fold_results,
+        'ensemble_results': ensemble_results,
     }
-
-    final_results.update(val_results)
-    final_results.update(test_results)
-
-    log_values.update(final_results)
-    wandb.log(log_values, step=step)
-    wandb.finish()
-
-    return final_results
-
-
-
-    

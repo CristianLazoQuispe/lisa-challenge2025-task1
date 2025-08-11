@@ -1,51 +1,33 @@
+"""
+Utilidades de soporte para el desafío LISA 2025.
 
-from sklearn.model_selection import train_test_split
-from sklearn.model_selection import StratifiedKFold
-from sklearn.model_selection import StratifiedGroupKFold
-import pandas as pd
-import numpy as np
+Este módulo contiene funciones para dividir los datos de forma robusta por
+paciente, estratificando según las etiquetas raras de severidad 2, así
+como funciones para calcular pesos de clase y fijar la semilla global.  Estas
+rutinas están inspiradas en el código original proporcionado por el usuario
+pero dependen únicamente de bibliotecas estándar.
+
+Variables de entorno como ``WANDB_API_KEY``, ``PROJECT_WANDB`` y ``ENTITY``
+deben definirse en un fichero ``.env`` o en el entorno antes de ejecutar
+este código para la integración con Weights & Biases.
+"""
+
+from __future__ import annotations
+
 import random
+from typing import Iterable, Dict, Tuple
+
+import numpy as np
+import pandas as pd
 import torch
+#from sklearn.model_selection import train_test_split, StratifiedKFold, StratifiedGroupKFold
+
 
 LABELS = ["Noise", "Zipper", "Positioning", "Banding", "Motion", "Contrast", "Distortion"]
 
 
-def robust_split_by_patient(df_train_original,df_train, args):
-    # Split using original data
-    df_all = df_train_original.copy()
-    df_all["patient_id"] = df_all["filename"].str.extract(r"(LISA_\d+)")
-    train_ids, test_ids = train_test_split(df_all["patient_id"].unique(), test_size=0.1, random_state=args.seed, shuffle=True)
-    df_train_original  = df_all[df_all["patient_id"].isin(train_ids)].reset_index(drop=True)
-    df_test_back       = df_all[df_all["patient_id"].isin(test_ids)].reset_index(drop=True)
-    # 🧠 Asignar folds robustos
-    #df_train_original = assign_robust_folds(df_train_original, n_splits=args.n_splits, top_k=2, seed=42)
-    df_train_original = assign_patient_stratified_folds(df_train_original, n_splits=args.n_splits, top_k=2, seed=42)
-
-    for i, label in enumerate(args.label_cols):
-        y = df_train_original[label].values
-        print(f"Train    : {label} true dist: {np.bincount(y, minlength=3)}")
-    for i, label in enumerate(args.label_cols):
-        y = df_test_back[label].values
-        print(f"Testback : {label} true dist: {np.bincount(y, minlength=3)}")
-    # Assign folds to processed data
-    df_all       = df_train.copy()
-    df_train     = df_all[df_all["patient_id"].isin(train_ids)].reset_index(drop=True)
-    df_test_back = df_all[df_all["patient_id"].isin(test_ids)].reset_index(drop=True)
-
-    # Filtrar duplicados y quedarte con la primera aparición
-    df_train_unique = df_train_original.drop_duplicates(subset=["patient_id", "fold"]).reset_index(drop=True)
-
-    print("df_train antes del merge : ",df_train.shape)
-    print("df_train_original antes del merge : ",df_train_original.shape)
-    print("df_train_unique   antes del merge : ",df_train_unique.shape)
-    #print(df_train_original[["patient_id","fold"]][df_train_original["patient_id"].isin(train_ids[:2])])
-    df_train = df_train.merge(df_train_unique[["patient_id","fold"]],on="patient_id",how="left")
-    print("df_train despues del merge : ",df_train.shape)
-    print(list(df_train.columns))
-    return df_train,df_test_back
-
-# Semilla global
-def set_seed(seed=42):
+def set_seed(seed: int = 42) -> None:
+    """Establece la semilla global para reproducibilidad."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -53,186 +35,182 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def compute_sample_weights(df, label_cols):
-    class_weights = {0: 1.0, 1: 10.0, 2: 15.0}
-    weights = []
-    for _, row in df.iterrows():
-        w = sum([class_weights[int(row[col])] for col in label_cols])
-        weights.append(w)
-    return weights
 
-import torch
-import numpy as np
+def label_severity_counts(df: pd.DataFrame, labels: Iterable[str] = LABELS, severity_class: int = 2) -> Dict[str, int]:
+    """Cuenta cuántas veces aparece la clase ``severity_class`` para cada etiqueta."""
+    return {label: int((df[label] == severity_class).sum()) for label in labels}
 
-def _safe_counts(series, num_classes=3):
-    """Devuelve conteos por clase [0..C-1] como np.array, con eps para evitar ceros."""
-    eps = 1e-6
-    counts = np.zeros(num_classes, dtype=np.float64)
-    vc = series.value_counts().to_dict()
-    for c in range(num_classes):
-        counts[c] = max(vc.get(c, 0), eps)
-    return counts
 
-def _weights_effective(n_counts, beta=0.99):
-    """Class-Balanced weights (Cui et al.) con normalización media=1."""
-    n = np.asarray(n_counts, dtype=np.float64)
-    eff_num = (1.0 - np.power(beta, n)) / (1.0 - beta)
-    w = 1.0 / eff_num
-    w /= w.mean()
-    return w
+def assign_patient_stratified_folds(df: pd.DataFrame, n_splits: int = 5, top_k: int = 2, seed: int = 42) -> pd.DataFrame:
+    """Asigna folds estratificados por paciente.
 
-def _weights_invfreq(n_counts, alpha=0.5, cap=8.0):
-    """Inversa de frecuencia^alpha con normalización media=1 y límite superior 'cap'."""
-    n = np.asarray(n_counts, dtype=np.float64)
-    N, K = n.sum(), len(n)
-    w = (N / (K * n)) ** alpha
-    w /= w.mean()
-    w = np.clip(w, 1.0 / cap, cap)
-    return w
+    Selecciona las ``top_k`` etiquetas con menor número de clase 2 para
+    construir una clave de estratificación y utiliza ``StratifiedGroupKFold``
+    para dividir por paciente manteniendo la distribución de esas etiquetas.
 
-def compute_weights_from_df(
-    df,
-    labels,
-    method: str = "effective",   # "effective" o "invfreq"
-    beta: float = 0.99,          # para "effective"
-    alpha: float = 0.5,          # para "invfreq"
-    cap: float = 8.0,            # para "invfreq"
-    device=None,
-    dtype=torch.float32,
-):
+    Args:
+        df: DataFrame con columnas ``patient_id`` y las etiquetas.
+        n_splits: Número de folds.
+        top_k: Número de etiquetas raras a usar para la estratificación.
+        seed: Semilla aleatoria.
+
+    Returns:
+        DataFrame con una columna ``fold`` que indica el número de fold para
+        cada fila.
     """
-    Devuelve {label: tensor([w0,w1,w2])}, normalizados (media≈1).
-    Pensado para usarse con Focal (γ≈1.5–2.0) + label_smoothing bajo (≈0.05).
-    """
-    if method == "manual":
-        weights_per_label = {
-            "Noise":      torch.tensor([1.0, 2.0, 5.0]),
-            "Zipper":     torch.tensor([1.0, 2.0, 5.0]),
-            "Positioning":torch.tensor([1.0, 2.0, 5.0]),
-            "Banding":    torch.tensor([1.0, 2.0, 5.0]),
-            "Motion":     torch.tensor([1.0, 2.0, 5.0]),
-            "Contrast":   torch.tensor([1.0, 2.0, 5.0]),
-            "Distortion": torch.tensor([1.0, 2.0, 5.0]),
-        }
-        return weights_per_label
-    
-    weights_per_label = {}
-    for label in labels:
-        n_counts = _safe_counts(df[label])
-
-        if method == "effective":
-            w = _weights_effective(n_counts, beta=beta)
-        elif method == "invfreq":
-            w = _weights_invfreq(n_counts, alpha=alpha, cap=cap)
-        else:
-            raise ValueError(f"method debe ser 'effective' o 'invfreq', no '{method}'.")
-
-        t = torch.tensor(w, dtype=dtype)
-        if device is not None:
-            t = t.to(device)
-        weights_per_label[label] = t
-    return weights_per_label
-
-
-def compute_weights_from_df_old(df, labels=LABELS, use_manual=False):
-    if use_manual:
-        weights_per_label = {
-            "Noise":      torch.tensor([1.0, 10.0, 20.0]),
-            "Zipper":     torch.tensor([1.0, 10.0, 20.0]),
-            "Positioning":torch.tensor([1.0, 10.0, 20.0]),
-            "Banding":    torch.tensor([1.0, 10.0, 20.0]),
-            "Motion":     torch.tensor([1.0, 10.0, 20.0]),
-            "Contrast":   torch.tensor([1.0, 10.0, 20.0]),
-            "Distortion": torch.tensor([1.0, 10.0, 20.0]),
-        }
-        return weights_per_label
-
-    weights = {}
-    for label in labels:
-        counts = df[label].value_counts(normalize=True).to_dict()
-        w = torch.tensor([
-            1.0 / counts.get(0, 1e-6),
-            1.0 / counts.get(1, 1e-6),
-            1.0 / counts.get(2, 1e-6)
-        ])
-        weights[label] = w / w.sum()
-    return weights
-
-def label_severity_counts(df, severity_class=2):
-    """Cuenta cuántas veces aparece la clase '2' por etiqueta."""
-    return {
-        col: (df[col] == severity_class).sum()
-        for col in df.columns if col not in ["ID", "group", "filename", "fold"]
-    }
-
-
-def label_severity_counts(df):
-    return {
-        label: (df[label] == 2).sum()
-        for label in LABELS
-    }
-
-
-
-def assign_patient_stratified_folds(df, n_splits=5, top_k=2, seed=42):
     df = df.copy()
-
-    # 1. Elegir etiquetas más raras con severidad 2 (como en tu código)
+    # Etiquetas más raras según severidad 2
     severity_counts = label_severity_counts(df)
     sorted_labels = sorted(severity_counts, key=severity_counts.get)
     selected_labels = sorted_labels[:top_k]
-    print(f"🎯 Labels usados para estratificación: {selected_labels}")
-
-    # 2. Crear clave combinada de estratificación (usando esas etiquetas)
+    # Clave de estratificación combinando las etiquetas seleccionadas
     df["stratify_key"] = df[selected_labels].astype(str).agg("|".join, axis=1)
-
-    # 3. Usar StratifiedGroupKFold para estratificar por paciente
+    # KFold estratificado por paciente
     sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-
     df["fold"] = -1
     for fold, (_, val_idx) in enumerate(
         sgkf.split(df, y=df["stratify_key"], groups=df["patient_id"])
     ):
         df.loc[val_idx, "fold"] = fold
-
-    # 4. Limpiar columnas auxiliares
     df = df.drop(columns=["stratify_key"])
-
     return df
 
-def assign_robust_folds(df, n_splits=5, top_k=2, seed=42):
-    df = df.copy()
 
-    # 1. Obtener las etiquetas más raras con clase 2
-    severity_counts = label_severity_counts(df)
+def assign_volume_stratified_folds(df: pd.DataFrame,
+                                   volume_id_col: str = 'patient_id',
+                                   label_cols: Iterable[str] = LABELS,
+                                   n_splits: int = 5,
+                                   top_k: int = 2,
+                                   seed: int = 42) -> pd.DataFrame:
+    """Asigna folds estratificados por volumen en un DataFrame de cortes 2D.
+
+    Este método está pensado para el caso en que cada volumen 3D está
+    representado por múltiples cortes 2D.  Se asegura de que todos los
+    cortes de un mismo volumen caigan en el mismo ``fold``, y utiliza una
+    estrategia de estratificación basada en la distribución de etiquetas
+    a nivel de volumen (tomando la severidad máxima de cada etiqueta a lo
+    largo de sus cortes).
+
+    Args:
+        df: DataFrame con columnas de etiquetas (``label_cols``) y la
+            columna ``volume_id_col`` que identifica a cada volumen (por
+            ejemplo, ``patient_id`` o ``filename`` sin sufijo de corte).
+        volume_id_col: Nombre de la columna que agrupa los cortes por
+            volumen.  Todos los registros con el mismo valor en esta
+            columna se asignarán al mismo fold.
+        label_cols: Lista de nombres de las columnas de etiquetas.
+        n_splits: Número de folds de cross‑validation.
+        top_k: Número de etiquetas raras (según severidad 2) a usar para
+            la clave de estratificación.
+        seed: Semilla aleatoria para reproducibilidad.
+
+    Returns:
+        El DataFrame original con una nueva columna ``fold`` asignando
+        cada corte a un fold.  Todos los cortes de un volumen comparten
+        el mismo número de fold.
+
+    Nota:
+        La función calcula primero la severidad máxima para cada etiqueta
+        en todos los cortes de cada volumen, creando así un vector de
+        etiquetas agregadas.  Luego cuenta cuántos volúmenes tienen
+        severidad 2 en cada etiqueta para identificar las etiquetas
+        minoritarias.  Se construye una clave de estratificación a partir
+        de estas etiquetas y se aplica ``StratifiedGroupKFold`` con el
+        identificador de volumen como ``groups``.  Finalmente, la
+        asignación de folds se propaga a todas las filas de ``df``.
+    """
+    if volume_id_col not in df.columns:
+        raise ValueError(f"El DataFrame no contiene la columna de volumen '{volume_id_col}'")
+    # Agrupar por volumen y calcular la severidad máxima para cada etiqueta
+    # Esto condensa las múltiples filas por volumen en una representación
+    # única que refleja la peor (máxima) severidad observada en cualquier
+    # corte para cada etiqueta.
+    agg_labels = (
+        df.groupby(volume_id_col)[list(label_cols)]
+          .max()
+          .reset_index()
+    )
+    # Contar severidad 2 por etiqueta a nivel de volumen para identificar
+    # las etiquetas más raras
+    severity_counts = label_severity_counts(agg_labels[label_cols])
+    # Ordenar etiquetas por recuento ascendente y elegir top_k
     sorted_labels = sorted(severity_counts, key=severity_counts.get)
     selected_labels = sorted_labels[:top_k]
-    print(f"🎯 Labels usados para estratificación: {selected_labels}")
-
-    # 2. Crear clave combinada para estratificación
-    df["stratify_key"] = df[selected_labels].astype(str).agg("|".join, axis=1)
-
-    # 3. Separar casos raros (combinaciones únicas)
-    key_counts = df["stratify_key"].value_counts()
-    rare_keys = key_counts[key_counts < 2].index.tolist()
-    df_rare = df[df["stratify_key"].isin(rare_keys)].copy()
-    df_common = df[~df["stratify_key"].isin(rare_keys)].copy()
-    print(f"🟡 Casos raros: {len(df_rare)} — Casos comunes: {len(df_common)}")
-
-    # 4. KFold estratificado sobre los comunes
-    df_common["fold"] = -1
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    for fold, (_, val_idx) in enumerate(skf.split(df_common, df_common["stratify_key"])):
-        df_common.loc[df_common.index[val_idx], "fold"] = fold
-
-    # 5. Asignar fold aleatorio a los raros
-    df_rare["fold"] = -1
-    for i, idx in enumerate(df_rare.index):
-        df_rare.loc[idx, "fold"] = i % n_splits
-
-    # 6. Unir y devolver
-    df_out = pd.concat([df_common, df_rare], axis=0).drop(columns=["stratify_key"])
-    df_out = df_out.sort_index().reset_index(drop=True)
-    return df_out
+    # Construir clave de estratificación combinando las etiquetas
+    agg_labels['stratify_key'] = agg_labels[selected_labels].astype(str).agg('|'.join, axis=1)
+    # Inicializar KFold estratificado por volumen
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    # Crear nueva columna fold en el DataFrame agregado
+    agg_labels['fold'] = -1
+    for fold, (_, val_idx) in enumerate(
+        sgkf.split(agg_labels, y=agg_labels['stratify_key'], groups=agg_labels[volume_id_col])
+    ):
+        agg_labels.loc[val_idx, 'fold'] = fold
+    # Propagar la asignación de folds al DataFrame original
+    df = df.copy()
+    df = df.merge(agg_labels[[volume_id_col, 'fold']], on=volume_id_col, how='left')
+    return df
 
 
+def compute_sample_weights(df: pd.DataFrame, label_cols: Iterable[str]) -> list[float]:
+    """Computa pesos por muestra basados en la frecuencia de combinaciones de etiquetas.
+
+    Cada muestra recibe un peso igual al inverso de la frecuencia de su
+    combinación de etiquetas.  Esto tiende a equilibrar el número de
+    muestras por combinación (puede ajustarse según sea necesario).
+    """
+    counts = df[label_cols].apply(lambda x: tuple(x), axis=1)
+    freq = counts.value_counts().to_dict()
+    return [1.0 / freq[tuple(row[label_cols])] for _, row in df.iterrows()]
+
+
+def compute_weights_from_df(
+    df: pd.DataFrame,
+    labels: Iterable[str],
+    method: str = "effective",
+    beta: float = 0.99,
+    alpha: float = 0.5,
+    cap: float = 8.0,
+    device=None,
+    dtype=torch.float32,
+) -> Dict[str, torch.Tensor]:
+    """Calcula pesos de clase por etiqueta.
+
+    Los pesos se normalizan para tener media ≈ 1.  Esto puede usarse con
+    CrossEntropy o Focal Loss.  ``method`` puede ser ``"effective"``
+    (Class‑Balanced) o ``"invfreq"`` (inversa de frecuencia^alpha).
+    """
+    def _safe_counts(series, num_classes=3):
+        eps = 1e-6
+        counts = np.zeros(num_classes, dtype=np.float64)
+        vc = series.value_counts().to_dict()
+        for c in range(num_classes):
+            counts[c] = max(vc.get(c, 0), eps)
+        return counts
+    def _weights_effective(n_counts, beta=beta):
+        n = np.asarray(n_counts, dtype=np.float64)
+        eff_num = (1.0 - np.power(beta, n)) / (1.0 - beta)
+        w = 1.0 / eff_num
+        w /= w.mean()
+        return w
+    def _weights_invfreq(n_counts, alpha=alpha, cap=cap):
+        n = np.asarray(n_counts, dtype=np.float64)
+        N, K = n.sum(), len(n)
+        w = (N / (K * n)) ** alpha
+        w /= w.mean()
+        w = np.clip(w, 1.0 / cap, cap)
+        return w
+    weights_per_label: Dict[str, torch.Tensor] = {}
+    for label in labels:
+        n_counts = _safe_counts(df[label])
+        if method == "effective":
+            w = _weights_effective(n_counts)
+        elif method == "invfreq":
+            w = _weights_invfreq(n_counts)
+        else:
+            raise ValueError(f"Método desconocido: {method}")
+        t = torch.tensor(w, dtype=dtype)
+        if device is not None:
+            t = t.to(device)
+        weights_per_label[label] = t
+    return weights_per_label
