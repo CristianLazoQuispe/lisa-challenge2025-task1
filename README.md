@@ -1,48 +1,96 @@
-# Desde la carpeta del proyecto (donde está el Dockerfile)
-docker build -t lisa_task1:0.1 .
+# RISE-MICCAI LISA 2025: MRI Quality Control
 
-############################
+Multi-label deep learning pipeline for artifact detection in 3D brain MRI scans.
 
-docker compose build --no-cache run
-docker compose up --build run
+## Quick Start
 
-up crea el contenedor run y ejecuta automáticamente el ENTRYPOINT de tu imagen (tu entrypoint.sh).
---build recompila si cambiaste algo del Dockerfile.
+### Installation
+```bash
+git clone https://github.com/yourusername/lisa-challenge2025-task1.git
+cd lisa-challenge2025-task1
+pip install -r requirements.txt
+```
 
-# Abrir un bash dentro del contenedor (sin ejecutar tu entrypoint)
-docker run -it --entrypoint bash lisa_task1:0.1
+### Training
+```bash
+python train.py \
+  --train_csv ./data/train.csv \
+  --save_dir ./models/exp1 \
+  --n_splits 5 \
+  --epochs 30 \
+  --batch_size 32 \
+  --base_model maxvit_nano_rw_256 \
+  --image_size 256 \
+  --device cuda:0
+```
 
-############################
+### Inference
+```bash
+# 1. Create metadata CSV
+python 2.csv_creation.py --val_path_dir /input --path_results ./results/
 
-# etiqueta para Synapse (nombre sugerido: task1)
-docker tag lisa_task1:0.1 docker.synapse.org/syn68765796/task1:0.1
+# 2. Convert 3D to 2D slices
+python 3.pipeline3dto2d.py \
+  --results_dir ./results/preprocessed_data \
+  --destination_dir ./results/2d_images_all
 
+# 3. Run model inference
+python train.py \
+  --test_csv ./results/preprocessed_data/df_test_imgs.csv \
+  --model_dir ./models/exp1 \
+  --do_inference
 
-# login y push
+# 4. Generate final predictions
+python predict.py \
+  --input ./results/preprocessed_data/submission_mean_preds.csv \
+  --output /output
+```
+
+## Docker Usage
+
+### Build & Run
+```bash
+# Build
+docker build -t lisa_task1:latest .
+
+# Development
+docker compose run --rm dev bash
+
+# Production
+docker compose up run
+```
+
+### Synapse Submission
+```bash
+# 1. Tag
+docker tag lisa_task1:latest docker.synapse.org/SYN_ID/task1:v1.0
+
+# 2. Login
 docker login docker.synapse.org
-docker push docker.synapse.org/syn68765796/task1:0.1
-docker push docker.synapse.org/syn68765796/task1:latest
 
+# 3. Push
+docker push docker.synapse.org/SYN_ID/task1:v1.0
 
-########### FINAL ###################
-docker build -t docker.synapse.org/syn68765796/conda20:0.1 .
-docker run -it --rm --gpus all -v E:\Datathon\LISA\input\task-1-val:/input:ro -v E:\Datathon\LISA\output:/output:rw docker.synapse.org/syn68765796/conda20:0.1
+# 4. Test locally
+docker run --rm --gpus all \
+  -v /path/to/input:/input:ro \
+  -v /path/to/output:/output:rw \
+  docker.synapse.org/SYN_ID/task1:v1.0
+```
 
+## Key Features
+- **7-class artifact detection**: Noise, Zipper, Positioning, Banding, Motion, Contrast, Distortion
+- **Vision Transformer backbone**: MaxViT with label token attention heads
+- **Brain-aware preprocessing**: Morphological operations + connected components
+- **5-fold cross-validation**: Patient-level stratified splitting
+- **Multi-aggregation strategies**: Mean, vote, max pooling across slices
+- **Focal loss + GIoU**: Combined classification and spatial localization
 
-docker run -it -v E:\Datathon\LISA\input\task-1-val:/input:ro -v E:\Datathon\LISA\output:/output:rw docker.synapse.org/syn68765796/conda20:0.1
-docker run --rm -v /mnt/e/Datathon/LISA/input/task-1-val:/input:ro -v /mnt/e/Datathon/LISA/output:/output:rw docker.synapse.org/syn68765796/conda20:0.1
-docker run -it -v /mnt/e/Datathon/LISA/input/task-1-val:/input:ro -v /mnt/e/Datathon/LISA/output:/output:rw docker.synapse.org/syn68765796/conda20:0.1
+## Requirements
+- GPU: NVIDIA with 4GB+ VRAM
+- CUDA: 11.7+
+- Python: 3.8+
+- Docker: 20.10+
 
-
-docker push docker.synapse.org/syn68765796/conda20:0.1
-
-
-
-# 1) Construir imagen local para debug (con tu código montado):
-docker compose -f docker-compose.yml up --build dev
-
-# 2) Probar ejecución "tipo Synapse" contra tu dataset local:
-docker compose -f docker-compose.yml up run
-
-# 3) abrir el terminal
-docker compose -f docker-compose.yml run --rm run bash
+## License
+MIT
