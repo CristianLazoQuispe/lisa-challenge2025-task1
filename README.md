@@ -42,7 +42,7 @@ python train.py \
   --model_dir ./models/exp1 \
   --do_inference
 
-# 4. Generate final predictions
+# 4. Generate final submission file
 python predict.py \
   --input ./results/preprocessed_data/submission_mean_preds.csv \
   --output /output
@@ -97,3 +97,4 @@ docker run --rm --gpus all \
 ## License
 
 MIT
+
