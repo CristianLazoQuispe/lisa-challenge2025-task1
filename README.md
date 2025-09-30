@@ -8,7 +8,7 @@ Multi-output multiclass classification deep learning pipeline for artifact detec
 
 ### Installation
 ```bash
-git clone https://github.com/yourusername/lisa-challenge2025-task1.git
+git clone [https://github.com/yourusername/lisa-challenge2025-task1.git](https://github.com/CristianLazoQuispe/lisa-challenge2025-task1)
 cd lisa-challenge2025-task1
 pip install -r requirements.txt
 ```
@@ -97,4 +97,5 @@ docker run --rm --gpus all \
 ## License
 
 MIT
+
 
