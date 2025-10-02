@@ -13,7 +13,7 @@ def main(args):
 
     val_list_paths = glob(
         os.path.join(
-            args.val_path_dir,
+            args.path_dir,
             '**',
             '*.nii.gz'),
         recursive=True)
@@ -23,8 +23,11 @@ def main(args):
     # Create initial DataFrame
     df_test = pd.DataFrame(val_list_paths, columns=['path'])
     df_test['filename'] = df_test['path'].apply(lambda x: os.path.basename(x))
-    df_test["patient_id"] = df_test["filename"].str.extract(
-        r"(LISA_(?:TESTING|VALIDATION)_\d+)")
+    if "train" in args.filename:
+        df_test["patient_id"]  = df_test["filename"].str.extract(r"(LISA_\d+)")
+    else:
+        df_test["patient_id"] = df_test["filename"].str.extract(
+            r"(LISA_(?:TESTING|VALIDATION)_\d+)")
     df_test = df_test[df_test['filename'].str.endswith(
         '.nii.gz')].reset_index(drop=True)
 
@@ -36,26 +39,29 @@ def main(args):
     # Save CSV
     results_dir = os.path.join(args.path_results, 'preprocessed_data/')
     os.makedirs(results_dir, exist_ok=True)
-    df_test.to_csv(os.path.join(results_dir, 'df_test.csv'), index=False)
+    df_test.to_csv(os.path.join(results_dir,args.filename), index=False)
     print(
         f"Saved preprocessed CSV to {
             os.path.join(
                 results_dir,
-                'df_test.csv')}")
+                args.filename)}"
+        )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Process validation dataset paths and metadata.")
-    parser.add_argument("--val_path_dir", type=str, default="./input/",
+    parser.add_argument("--path_dir", type=str, default="./input/",
                         help="Directory containing validation files.")
     parser.add_argument("--path_results", type=str, default="./results/",
                         help="Directory to save results.")
+    parser.add_argument("--filename", type=str, default="df_test.csv",
+                        help="Filename for the output CSV.")
 
     args = parser.parse_args()
     main(args)
 
-    # python 2.csv_creation.py --val_path_dir "/input/" --path_results "./results/"
-    # python 2.csv_creation.py --val_path_dir
+    # python 2.csv_creation.py --path_dir "/input/" --path_results "./results/"
+    # python 2.csv_creation.py --path_dir
     # "E:\Datathon\LISA\input\task-1-val" --path_results
     # "E:\Datathon\LISA\results"

@@ -17,6 +17,11 @@ pip install -r requirements.txt
 
 ### Training
 ```bash
+python download_data.py
+python csv_creation.py --path_dir "/data/cristian/projects/med_data/rise-miccai/task-1/" --path_results "./results/" --filename "df_train.csv"
+python csv_creation.py --path_dir "/data/cristian/projects/med_data/rise-miccai/task-1-val/" --path_results "./results/" --filename "df_test.csv"
+python pipeline3dto2d.py --results_dir "./results/preprocessed_data" --destination_dir "/data/cristian/projects/med_data/rise-miccai/task-1-val/2d_images_all/"
+
 python train.py \
   --train_csv ./data/train.csv \
   --save_dir ./models/exp1 \
@@ -31,7 +36,7 @@ python train.py \
 ### Inference
 ```bash
 # 1. Create metadata CSV
-python csv_creation.py --val_path_dir /input --path_results ./results/
+python csv_creation.py --path_dir /input --path_results ./results/
 
 # 2. Convert 3D to 2D slices
 python pipeline3dto2d.py \
