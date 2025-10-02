@@ -5,23 +5,19 @@ Datasets for the LISA 2025 challenge.
 from __future__ import annotations
 
 import os
-from typing import List, Iterable, Optional
+import sys
+from typing import Iterable, List, Optional
 
-import numpy as np
-import joblib
-from PIL import Image
-from tqdm import tqdm
-from torch.utils.data import Dataset
-import torch
 import albumentations as A
+import joblib
+import numpy as np
+import torch
 from albumentations.pytorch import ToTensorV2
-import sys
-import gc
-import os
-import cv2
-import sys
-import gc
-import os
+from PIL import Image
+from torch.utils.data import Dataset
+from tqdm import tqdm
+
+import new_augmentations
 
 # Ruta absoluta del script actual
 current_path = os.path.dirname(os.path.abspath(__file__))
@@ -29,8 +25,6 @@ current_path = os.path.dirname(os.path.abspath(__file__))
 # Agregar al sys.path si no está
 if current_path not in sys.path:
     sys.path.append(current_path)
-
-import new_augmentations
 
 
 class MRIDataset2D(Dataset):
@@ -82,7 +76,7 @@ class MRIDataset2D(Dataset):
                  is_numpy: bool = True,
                  labels: Iterable[str] = (),
                  image_size: int = 224,
-                 use_norma : bool = True,
+                 use_norma: bool = True,
                  norm_mode: str = "slice_z",
                  per_view_stats: Optional[dict] = None,
                  dataset_mean: Optional[float] = None,
@@ -96,7 +90,8 @@ class MRIDataset2D(Dataset):
         self.image_size = image_size
         # Legacy flag: apply z-score per slice if norm_mode remains "slice_z".
         self.use_norma = use_norma
-        # Normalisation mode: "slice_z" (per-slice z-score), "dataset_z_per_view" (fixed stats per view) or "none".
+        # Normalisation mode: "slice_z" (per-slice z-score),
+        # "dataset_z_per_view" (fixed stats per view) or "none".
         self.norm_mode = norm_mode
         # Optional stats for dataset_z_per_view mode
         self.per_view_stats = per_view_stats or {}
@@ -114,9 +109,13 @@ class MRIDataset2D(Dataset):
         # Preload data if using numpy for efficiency
         self.data: List[np.ndarray | None] = [None] * len(self.df)
         if self.is_numpy:
-            for idx in tqdm(range(len(self.df)), desc="Loading arrays", disable=len(self.df) < 100):
-                path = self.df.iloc[idx].get('npy_path') or self.df.iloc[idx].get('img_path')
-                # Replace .npy with .pkl if present (for backward compatibility)
+            for idx in tqdm(range(len(self.df)),
+                            desc="Loading arrays",
+                            disable=len(self.df) < 100):
+                path = self.df.iloc[idx].get(
+                    'npy_path') or self.df.iloc[idx].get('img_path')
+                # Replace .npy with .pkl if present (for backward
+                # compatibility)
                 if path and path.endswith('.npy'):
                     path = path.replace('.npy', '.pkl')
                 arr = joblib.load(path)
@@ -140,7 +139,7 @@ class MRIDataset2D(Dataset):
                 # 🖼️ Zoom tipo crop + resize (cambia FOV)
                 A.RandomResizedCrop(size=(image_size, image_size), scale=(0.8, 1.0), ratio=(0.8, 1.2), p=1),
                 #A.ShiftScaleRotate(shift_limit=0.28, scale_limit=0.15, rotate_limit=20, border_mode=cv2.BORDER_CONSTANT, fill=0, p=1.0),
-            ], p=0.3),                        
+            ], p=0.3),
             # One of mild noise or blur
             A.OneOf([
                 A.GaussNoise(std_range=(1e-5, 2e-1), mean_range=(0,1e-4), p=1.0),   # ruido muy leve
@@ -181,36 +180,63 @@ class MRIDataset2D(Dataset):
             # Minor affine transformations (scale and translation)
             A.OneOf([
                 # 🔎 Zoom + desplazamiento leve
-                #A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
-                A.Affine(scale=(0.9, 1.1), translate_percent=(0.0, 0.1), rotate=(-15, 15), p=1.0),
+                # A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+                A.Affine(scale=(0.9, 1.1), translate_percent=(
+                    0.0, 0.1), rotate=(-15, 15), p=1.0),
                 # 🔳 Apagar zonas aleatorias (simula distorsión visual o falta de señal)
-                A.CoarseDropout(num_holes_range=(1,2), hole_height_range=(0.1, 0.2), hole_width_range=(0.1, 0.2), fill=0, p=1.0),
+                A.CoarseDropout(
+                    num_holes_range=(
+                        1, 2), hole_height_range=(
+                        0.1, 0.2), hole_width_range=(
+                        0.1, 0.2), fill=0, p=1.0),
                 # 🖼️ Zoom tipo crop + resize (cambia FOV)
-                A.RandomResizedCrop(size=(image_size, image_size), scale=(0.8, 1.0), ratio=(0.8, 1.2), p=1),
-            ], p=0.3),                        
+                A.RandomResizedCrop(
+                    size=(
+                        image_size, image_size), scale=(
+                        0.8, 1.0), ratio=(
+                        0.8, 1.2), p=1),
+            ], p=0.3),
             # One of mild noise or blur
             A.OneOf([
-                A.GaussNoise(std_range=(1e-5, 2e-1), mean_range=(0,1e-4), p=1.0),   # ruido muy leve
-                A.GaussianBlur(sigma_limit= (0.5,5), blur_limit=(3,20), p=1.0),                # desenfoque apenas perceptible
-                A.MedianBlur(blur_limit=(3,21), p=1.0),
+                A.GaussNoise(
+                    std_range=(
+                        1e-5,
+                        2e-1),
+                    mean_range=(
+                        0,
+                        1e-4),
+                    p=1.0),
+                # ruido muy leve
+                A.GaussianBlur(
+                    sigma_limit=(
+                        0.5, 5), blur_limit=(
+                        3, 20), p=1.0),                # desenfoque apenas perceptible
+                A.MedianBlur(blur_limit=(3, 21), p=1.0),
             ], p=0.3),
 
             A.OneOf([
-                A.MultiplicativeNoise(multiplier=(0.95, 1.2), p=1.0),   # cambia el contraste levemente
-                A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1,p=1.0),
-                A.CLAHE(clip_limit=2,p=1.0),
+                # cambia el contraste levemente
+                A.MultiplicativeNoise(multiplier=(0.95, 1.2), p=1.0),
+                A.RandomBrightnessContrast(
+                    brightness_limit=0.1, contrast_limit=0.1, p=1.0),
+                A.CLAHE(clip_limit=2, p=1.0),
             ], p=0.3),
 
-            new_augmentations.RandomZipperStripe(p=0.20, max_amp=0.18, min_period=6, max_period=22, axis="rand"),
+            new_augmentations.RandomZipperStripe(
+                p=0.20, max_amp=0.18, min_period=6, max_period=22, axis="rand"),
             new_augmentations.RandomBandCut(p=0.12),
 
         ]
-        return A.Compose([A.Resize(image_size, image_size)] + aug_transforms + [ToTensorV2()])
+        return A.Compose([A.Resize(image_size, image_size)] +
+                         aug_transforms + [ToTensorV2()])
 
     def __len__(self) -> int:
         return len(self.df)
 
-    def _apply_normalization(self, img: np.ndarray, view_code: str) -> np.ndarray:
+    def _apply_normalization(
+            self,
+            img: np.ndarray,
+            view_code: str) -> np.ndarray:
         """
         Apply normalisation to the slice according to the selected mode.
         Supported modes:
@@ -234,9 +260,9 @@ class MRIDataset2D(Dataset):
         """
         x = img.astype(np.float32)
         mode = self.norm_mode or "none"
-        #print("MODE : ",mode)
-        #print("self.use_norma : ",self.use_norma)
-        #print("MODE : ",mode)
+        # print("MODE : ",mode)
+        # print("self.use_norma : ",self.use_norma)
+        # print("MODE : ",mode)
         # No normalisation
         if mode == "none":
             return x
@@ -250,17 +276,17 @@ class MRIDataset2D(Dataset):
             return np.zeros_like(x, dtype=np.float32)
         # Fixed stats per view
         if mode == "dataset_z_per_view":
-            #print("per_view_stats:",self.per_view_stats)
-            #print("view_code:",view_code)
+            # print("per_view_stats:",self.per_view_stats)
+            # print("view_code:",view_code)
             stats = self.per_view_stats.get(view_code)
-            #print("stats:",stats)
+            # print("stats:",stats)
             if stats is not None:
                 p1 = stats.get("p1")
                 p99 = stats.get("p99")
                 mu = stats.get("mean")
                 sigma = stats.get("std")
                 # Clip if percentiles provided
-                #print("Using dataset_z_per_view")
+                # print("Using dataset_z_per_view")
                 if p1 is not None and p99 is not None:
                     x = np.clip(x, p1, p99)
                 if sigma is not None and sigma > 0:
@@ -281,11 +307,14 @@ class MRIDataset2D(Dataset):
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
-        # Determine the view from the path: everything after '_LF_' until '.nii'
-        full_path = row.get('npy_path')# or row.get('filename') or row.get('img_path') or row.get('npy_path')
+        # Determine the view from the path: everything after '_LF_' until
+        # '.nii'
+        # or row.get('filename') or row.get('img_path') or row.get('npy_path')
+        full_path = row.get('npy_path')
         if full_path is None:
             raise ValueError("Row is missing a valid path or filename column")
-        # Extract view code (axi/cor/sag) from something like '..._LF_axi.nii.gz'
+        # Extract view code (axi/cor/sag) from something like
+        # '..._LF_axi.nii.gz'
         try:
             if "_lf_" in full_path:
                 view_code = full_path.split('_lf_')[-1].split('_')[0]
@@ -294,8 +323,9 @@ class MRIDataset2D(Dataset):
 
         except Exception:
             view_code = 'axi'
-        view_onehot = self.view2onehot.get(view_code, torch.tensor([1, 0, 0], dtype=torch.float32))
-        #print("view_onehot:",view_onehot)
+        view_onehot = self.view2onehot.get(
+            view_code, torch.tensor([1, 0, 0], dtype=torch.float32))
+        # print("view_onehot:",view_onehot)
         # Load image as numpy array
         if self.is_numpy:
             arr = self.data[idx]
@@ -317,17 +347,19 @@ class MRIDataset2D(Dataset):
         img = np.expand_dims(img, axis=-1)
         # Apply transforms to convert to tensor
         if self.transform:
-            img = self.transform(image=img)['image']  # returns tensor (1, H, W)
+            # returns tensor (1, H, W)
+            img = self.transform(image=img)['image']
 
         img_np = img.numpy().squeeze()  # HxW float32, ya augmentado y recortado
-        #x_,y_,r_ = new_augmentations._brain_centroid_radius(img_np)
-        top, bottom, left, right = new_augmentations._brain_margins_connected(img_np)
-        
+        # x_,y_,r_ = new_augmentations._brain_centroid_radius(img_np)
+        top, bottom, left, right = new_augmentations._brain_margins_connected(
+            img_np)
 
-        aux_tensor = torch.tensor([top, bottom, left, right], dtype=torch.float32)
+        aux_tensor = torch.tensor(
+            [top, bottom, left, right], dtype=torch.float32)
         if self.is_train:
             label_values = row[self.labels].values.astype(np.int64)
             labels_tensor = torch.tensor(label_values, dtype=torch.long)
-            return img, labels_tensor, full_path, view_onehot,aux_tensor
+            return img, labels_tensor, full_path, view_onehot, aux_tensor
         else:
-            return img, -1, full_path, view_onehot,aux_tensor
+            return img, -1, full_path, view_onehot, aux_tensor

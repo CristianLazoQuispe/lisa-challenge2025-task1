@@ -1,6 +1,16 @@
+import copy
 import os
 import sys
-from scipy.ndimage import binary_erosion, binary_dilation, generate_binary_structure
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from joblib import dump
+from scipy.ndimage import binary_dilation, binary_erosion
+from tqdm import tqdm
+
+from dataset3D import MRIDataset3D
+
 # Ruta absoluta del script actual
 current_path = os.path.dirname(os.path.abspath(__file__))
 
@@ -8,34 +18,26 @@ current_path = os.path.dirname(os.path.abspath(__file__))
 if current_path not in sys.path:
     sys.path.append(current_path)
 
-from dataset3D import MRIDataset3D
-import matplotlib.pyplot as plt
-from joblib import dump
-from tqdm import tqdm
-import pandas as pd
-import numpy as np
-import copy
-import os
 
 class PreProcessing3Dto2D:
-    def __init__(self,binarize_threshold=0.15):
+    def __init__(self, binarize_threshold=0.15):
         self.binarize_threshold = binarize_threshold
-   
-    def morphological_operations(self,original):
+
+    def morphological_operations(self, original):
         mask = original >= self.binarize_threshold
 
         H, W = original.shape
-        final  = binary_dilation(mask,  structure=np.ones((2,2), dtype=bool))
-        final  = binary_erosion(final,  structure=np.ones((2,2), dtype=bool))
-        final  = binary_dilation(final, structure=np.ones((2,2), dtype=bool))
-        final  = binary_erosion(final,  structure=np.ones((3,3), dtype=bool))
-        final  = binary_dilation(final, structure=np.ones((3,3), dtype=bool))
-        final  = binary_dilation(final, structure=np.ones((5,5), dtype=bool))
-        final  = binary_erosion(final,  structure=np.ones((2,2), dtype=bool))
-        ratio  = np.count_nonzero(mask)/(H*W)
+        final = binary_dilation(mask, structure=np.ones((2, 2), dtype=bool))
+        final = binary_erosion(final, structure=np.ones((2, 2), dtype=bool))
+        final = binary_dilation(final, structure=np.ones((2, 2), dtype=bool))
+        final = binary_erosion(final, structure=np.ones((3, 3), dtype=bool))
+        final = binary_dilation(final, structure=np.ones((3, 3), dtype=bool))
+        final = binary_dilation(final, structure=np.ones((5, 5), dtype=bool))
+        final = binary_erosion(final, structure=np.ones((2, 2), dtype=bool))
+        ratio = np.count_nonzero(mask) / (H * W)
         return final, ratio
 
-    def reorientation(self,slices, view_axis):
+    def reorientation(self, slices, view_axis):
         # Reorient slices según vista
         if view_axis == "sag":
             slices = slices
@@ -47,35 +49,57 @@ class PreProcessing3Dto2D:
             raise ValueError(f"Invalid view_axis: {view_axis}")
         return slices
 
-    def pipeline_3Dto2D(self,df_data,destination_dir,folder="",
-                        labels=["Noise", "Zipper", "Positioning", "Banding", "Motion", "Contrast", "Distortion"]):
-        destination_dir = os.path.join(destination_dir,folder)
-        os.makedirs(destination_dir,exist_ok=True)
+    def pipeline_3Dto2D(
+        self,
+        df_data,
+        destination_dir,
+        folder="",
+        labels=[
+            "Noise",
+            "Zipper",
+            "Positioning",
+            "Banding",
+            "Motion",
+            "Contrast",
+            "Distortion"]):
+        destination_dir = os.path.join(destination_dir, folder)
+        os.makedirs(destination_dir, exist_ok=True)
 
         results = []
-        for idx in tqdm(range(0,df_data.shape[0])):
+        for idx in tqdm(range(0, df_data.shape[0])):
 
-            nifti_path = df_data.loc[idx,"path"]
-            filename = df_data.loc[idx,"filename"]
+            nifti_path = df_data.loc[idx, "path"]
+            filename = df_data.loc[idx, "filename"]
             df = pd.DataFrame({"path": [nifti_path], "filename": [filename]})
-            dataset = MRIDataset3D(df, is_train=False,spatial_size=(40,120,120),labels=labels)
-            volume,_,filename,view = dataset[0]
+            dataset = MRIDataset3D(
+                df, is_train=False, spatial_size=(
+                    40, 120, 120), labels=labels)
+            volume, _, filename, view = dataset[0]
             volume = volume[0].cpu().numpy()
-
 
             for idx_slice in range(volume.shape[0]):
                 original = copy.deepcopy(volume[idx_slice])
-                mask, ratio     = self.morphological_operations(original)
+                mask, ratio = self.morphological_operations(original)
                 mask = np.array(mask, dtype=np.float32)
-                img_path = os.path.join(destination_dir,filename.replace(".nii.gz",f"_{idx_slice}.png"))
-                pkl_path = os.path.join(destination_dir,filename.replace(".nii.gz",f"_{idx_slice}.pkl"))
-                npy_path = os.path.join(destination_dir,filename.replace(".nii.gz",f"_{idx_slice}.npy"))
-                #print(img_path)
+                img_path = os.path.join(
+                    destination_dir, filename.replace(
+                        ".nii.gz", f"_{idx_slice}.png"))
+                pkl_path = os.path.join(
+                    destination_dir, filename.replace(
+                        ".nii.gz", f"_{idx_slice}.pkl"))
+                npy_path = os.path.join(
+                    destination_dir, filename.replace(
+                        ".nii.gz", f"_{idx_slice}.npy"))
+                # print(img_path)
                 np.save(npy_path, volume[idx_slice])
                 slice_ = np.load(npy_path)
-                dump(slice_,pkl_path)
+                dump(slice_, pkl_path)
                 plt.imsave(img_path, volume[idx_slice], cmap="gray")
 
-                values= {"filename":filename,"img_path":img_path,"npy_path":npy_path,"ratio":ratio}
+                values = {
+                    "filename": filename,
+                    "img_path": img_path,
+                    "npy_path": npy_path,
+                    "ratio": ratio}
                 results.append(values)
         return results

@@ -1,29 +1,20 @@
-"""
-Utilidades de soporte para el desafío LISA 2025.
-
-Este módulo contiene funciones para dividir los datos de forma robusta por
-paciente, estratificando según las etiquetas raras de severidad 2, así
-como funciones para calcular pesos de clase y fijar la semilla global.  Estas
-rutinas están inspiradas en el código original proporcionado por el usuario
-pero dependen únicamente de bibliotecas estándar.
-
-Variables de entorno como ``WANDB_API_KEY``, ``PROJECT_WANDB`` y ``ENTITY``
-deben definirse en un fichero ``.env`` o en el entorno antes de ejecutar
-este código para la integración con Weights & Biases.
-"""
-
 from __future__ import annotations
 
 import random
-from typing import Iterable, Dict, Tuple
+from typing import Dict, Iterable
 
 import numpy as np
 import pandas as pd
 import torch
-#from sklearn.model_selection import train_test_split, StratifiedKFold, StratifiedGroupKFold
 
-
-LABELS = ["Noise", "Zipper", "Positioning", "Banding", "Motion", "Contrast", "Distortion"]
+LABELS = [
+    "Noise",
+    "Zipper",
+    "Positioning",
+    "Banding",
+    "Motion",
+    "Contrast",
+    "Distortion"]
 
 
 def set_seed(seed: int = 42) -> None:
@@ -36,12 +27,20 @@ def set_seed(seed: int = 42) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def label_severity_counts(df: pd.DataFrame, labels: Iterable[str] = LABELS, severity_class: int = 2) -> Dict[str, int]:
+def label_severity_counts(df: pd.DataFrame,
+                          labels: Iterable[str] = LABELS,
+                          severity_class: int = 2) -> Dict[str,
+                                                           int]:
     """Cuenta cuántas veces aparece la clase ``severity_class`` para cada etiqueta."""
-    return {label: int((df[label] == severity_class).sum()) for label in labels}
+    return {label: int((df[label] == severity_class).sum())
+            for label in labels}
 
 
-def assign_patient_stratified_folds(df: pd.DataFrame, n_splits: int = 5, top_k: int = 2, seed: int = 42) -> pd.DataFrame:
+def assign_patient_stratified_folds(
+        df: pd.DataFrame,
+        n_splits: int = 5,
+        top_k: int = 2,
+        seed: int = 42) -> pd.DataFrame:
     """Asigna folds estratificados por paciente.
 
     Selecciona las ``top_k`` etiquetas con menor número de clase 2 para
@@ -66,7 +65,10 @@ def assign_patient_stratified_folds(df: pd.DataFrame, n_splits: int = 5, top_k: 
     # Clave de estratificación combinando las etiquetas seleccionadas
     df["stratify_key"] = df[selected_labels].astype(str).agg("|".join, axis=1)
     # KFold estratificado por paciente
-    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    sgkf = StratifiedGroupKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=seed)
     df["fold"] = -1
     for fold, (_, val_idx) in enumerate(
         sgkf.split(df, y=df["stratify_key"], groups=df["patient_id"])
@@ -120,7 +122,8 @@ def assign_volume_stratified_folds(df: pd.DataFrame,
         asignación de folds se propaga a todas las filas de ``df``.
     """
     if volume_id_col not in df.columns:
-        raise ValueError(f"El DataFrame no contiene la columna de volumen '{volume_id_col}'")
+        raise ValueError(
+            f"El DataFrame no contiene la columna de volumen '{volume_id_col}'")
     # Agrupar por volumen y calcular la severidad máxima para cada etiqueta
     # Esto condensa las múltiples filas por volumen en una representación
     # única que refleja la peor (máxima) severidad observada en cualquier
@@ -137,22 +140,27 @@ def assign_volume_stratified_folds(df: pd.DataFrame,
     sorted_labels = sorted(severity_counts, key=severity_counts.get)
     selected_labels = sorted_labels[:top_k]
     # Construir clave de estratificación combinando las etiquetas
-    agg_labels['stratify_key'] = agg_labels[selected_labels].astype(str).agg('|'.join, axis=1)
+    agg_labels['stratify_key'] = agg_labels[selected_labels].astype(
+        str).agg('|'.join, axis=1)
     # Inicializar KFold estratificado por volumen
-    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    sgkf = StratifiedGroupKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=seed)
     # Crear nueva columna fold en el DataFrame agregado
     agg_labels['fold'] = -1
-    for fold, (_, val_idx) in enumerate(
-        sgkf.split(agg_labels, y=agg_labels['stratify_key'], groups=agg_labels[volume_id_col])
-    ):
+    for fold, (_, val_idx) in enumerate(sgkf.split(
+            agg_labels, y=agg_labels['stratify_key'], groups=agg_labels[volume_id_col])):
         agg_labels.loc[val_idx, 'fold'] = fold
     # Propagar la asignación de folds al DataFrame original
     df = df.copy()
-    df = df.merge(agg_labels[[volume_id_col, 'fold']], on=volume_id_col, how='left')
+    df = df.merge(agg_labels[[volume_id_col, 'fold']],
+                  on=volume_id_col, how='left')
     return df
 
 
-def compute_sample_weights(df: pd.DataFrame, label_cols: Iterable[str]) -> list[float]:
+def compute_sample_weights(df: pd.DataFrame,
+                           label_cols: Iterable[str]) -> list[float]:
     """Computa pesos por muestra basados en la frecuencia de combinaciones de etiquetas.
 
     Cada muestra recibe un peso igual al inverso de la frecuencia de su
@@ -187,12 +195,14 @@ def compute_weights_from_df(
         for c in range(num_classes):
             counts[c] = max(vc.get(c, 0), eps)
         return counts
+
     def _weights_effective(n_counts, beta=beta):
         n = np.asarray(n_counts, dtype=np.float64)
         eff_num = (1.0 - np.power(beta, n)) / (1.0 - beta)
         w = 1.0 / eff_num
         w /= w.mean()
         return w
+
     def _weights_invfreq(n_counts, alpha=alpha, cap=cap):
         n = np.asarray(n_counts, dtype=np.float64)
         N, K = n.sum(), len(n)

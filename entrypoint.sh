@@ -42,12 +42,12 @@ ls -la "${OUTPUT_DIR:-/output}" || true
 
 # ----- TU PIPELINE -----
 echo "[STEP] 1) csv_creation"
-python /my_solution/2.csv_creation.py \
+python /my_solution/csv_creation.py \
   --val_path_dir "${INPUT_DIR:-/input}" \
   --path_results "/my_solution/results/"
 
 echo "[STEP] 2) 3D->2D"
-python /my_solution/3.pipeline3dto2d.py \
+python /my_solution/pipeline3dto2d.py \
   --results_dir "/my_solution/results/preprocessed_data" \
   --destination_dir "/my_solution/results/2d_images_all"
 
@@ -58,7 +58,7 @@ python /my_solution/train.py \
   --test_csv "/my_solution/results/preprocessed_data/df_test_imgs.csv"
 
 echo "[STEP] 4) predict -> CSV final"
-python /my_solution/predict.py \
+python /my_solution/submission.py \
   --input "/my_solution/results/preprocessed_data/submission_mean_preds.csv" \
   --output "${OUTPUT_DIR:-/output}"
 

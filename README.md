@@ -4,6 +4,8 @@ Challenge: Low-field pediatric brain magnetic resonance Image Segmentation and q
 
 Multi-output multiclass classification deep learning pipeline for artifact detection in 3D brain MRI scans.
 
+![Pipeline Architecture](images/pipeline.png)
+
 ## Quick Start
 
 ### Installation
@@ -29,10 +31,10 @@ python train.py \
 ### Inference
 ```bash
 # 1. Create metadata CSV
-python 2.csv_creation.py --val_path_dir /input --path_results ./results/
+python csv_creation.py --val_path_dir /input --path_results ./results/
 
 # 2. Convert 3D to 2D slices
-python 3.pipeline3dto2d.py \
+python pipeline3dto2d.py \
   --results_dir ./results/preprocessed_data \
   --destination_dir ./results/2d_images_all
 
@@ -43,7 +45,7 @@ python train.py \
   --do_inference
 
 # 4. Generate final submission file
-python predict.py \
+python submission.py \
   --input ./results/preprocessed_data/submission_mean_preds.csv \
   --output /output
 ```
