@@ -30,8 +30,8 @@ WORKDIR /my_solution
 
 # Código
 COPY ./src ./src
-COPY ./2.csv_creation.py ./2.csv_creation.py
-COPY ./3.pipeline3dto2d.py ./3.pipeline3dto2d.py
+COPY ./csv_creation.py ./csv_creation.py
+COPY ./pipeline3dto2d.py ./pipeline3dto2d.py
 COPY ./train.py ./train.py
 
 # Weights
@@ -40,7 +40,7 @@ COPY ./results/new_model_bbox_giou_brain0.1_l0.1 /my_solution/models/new_model_b
 
 # Entrypoint + predictor dentro de /my_solution
 COPY ./entrypoint.sh /my_solution/entrypoint.sh
-COPY ./predict.py /my_solution/predict.py
+COPY ./submission.py /my_solution/submission.py
 RUN chmod +x /my_solution/entrypoint.sh
 
 ENV INPUT_DIR=/input \
