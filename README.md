@@ -1,12 +1,14 @@
 # RISE-MICCAI LISA 2025: MRI Quality Control
 
-Multi-label deep learning pipeline for artifact detection in 3D brain MRI scans.
+Challenge: Low-field pediatric brain magnetic resonance Image Segmentation and quality Assurance Challenge
+
+Multi-output multiclass classification deep learning pipeline for artifact detection in 3D brain MRI scans.
 
 ## Quick Start
 
 ### Installation
 ```bash
-git clone https://github.com/yourusername/lisa-challenge2025-task1.git
+git clone https://github.com/CristianLazoQuispe/lisa-challenge2025-task1
 cd lisa-challenge2025-task1
 pip install -r requirements.txt
 ```
@@ -40,7 +42,7 @@ python train.py \
   --model_dir ./models/exp1 \
   --do_inference
 
-# 4. Generate final predictions
+# 4. Generate final submission file
 python predict.py \
   --input ./results/preprocessed_data/submission_mean_preds.csv \
   --output /output
@@ -93,4 +95,8 @@ docker run --rm --gpus all \
 - Docker: 20.10+
 
 ## License
+
 MIT
+
+
+

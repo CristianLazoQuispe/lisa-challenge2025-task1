@@ -34,7 +34,7 @@ COPY ./2.csv_creation.py ./2.csv_creation.py
 COPY ./3.pipeline3dto2d.py ./3.pipeline3dto2d.py
 COPY ./train.py ./train.py
 
-# Pesos (dentro de la imagen); si prefieres montarlos, mira el compose de abajo
+# Weights
 RUN mkdir -p /my_solution/models/new_model_bbox_giou_brain0.1_l0.1
 COPY ./results/new_model_bbox_giou_brain0.1_l0.1 /my_solution/models/new_model_bbox_giou_brain0.1_l0.1
 
@@ -46,5 +46,6 @@ RUN chmod +x /my_solution/entrypoint.sh
 ENV INPUT_DIR=/input \
     OUTPUT_DIR=/output \
     MODEL_DIR=/my_solution/models/new_model_bbox_giou_brain0.1_l0.1
+
 
 ENTRYPOINT ["/my_solution/entrypoint.sh"]
