@@ -1,4 +1,5 @@
-# RISE-MICCAI LISA 2025: MRI Quality Control
+# Robust Multi-Label Classification of MRI Artifacts in Low-Field Neonatal Brain Imaging via View-Conditional Dual-Task Learning
+## MICCAI LISA CHALLENGE 2025: MRI Quality Control
 
 Challenge: Low-field pediatric brain magnetic resonance Image Segmentation and quality Assurance Challenge
 
@@ -104,6 +105,7 @@ docker run --rm --gpus all \
 ## License
 
 MIT
+
 
 
 
